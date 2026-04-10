@@ -85,9 +85,13 @@ class TransitionParams:
 
 @dataclass
 class SensorParams:
-    """Sensor model: detection probability and field-of-view radius."""
-    pm: float = 0.90        # correct detection probability
-    fov_radius: int = 4     # Chebyshev (square) FOV half-width in cells
+    pm: float = 0.90
+    fov_radius: int = 4
+    n_states: int = 3
+
+    def __post_init__(self):
+        if not 0.0 < self.pm <= 1.0:
+            raise ValueError(f"pm must be in (0, 1], got {self.pm}")
 
 
 @dataclass
@@ -187,39 +191,12 @@ def normalize_belief(belief: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return belief / denom
 
 
-def observation_confusion_matrix(pm: float) -> np.ndarray:
-    """
-    Build 3x3 sensor confusion matrix M[s, y] = P(obs=y | true=s).
-
-    Diagonal = pm (correct detection).  Off-diagonal splits:
-      HEALTHY: errors mostly to FIRE (false alarm)
-      FIRE:    errors mostly to HEALTHY (missed fire)
-      BURNED:  lower detection (pm-0.05), errors split FIRE/HEALTHY
-    """
-    pm = float(np.clip(pm, 0.0, 1.0))
-    err = 1.0 - pm
-
-    p_h_f = 0.75 * err      # P(obs=FIRE  | true=HEALTHY)
-    p_h_b = 0.25 * err      # P(obs=BURNED| true=HEALTHY)
-
-    p_f_h = 0.75 * err      # P(obs=HEALTHY| true=FIRE)
-    p_f_b = 0.25 * err      # P(obs=BURNED | true=FIRE)
-
-    pm_b  = max(pm - 0.05, 0.0)
-    err_b = 1.0 - pm_b
-    p_b_f = 0.75 * err_b    # P(obs=FIRE   | true=BURNED)
-    p_b_h = 0.25 * err_b    # P(obs=HEALTHY| true=BURNED)
-
-    M = np.array(
-        [
-            [pm,   p_h_f, p_h_b],
-            [p_f_h, pm,   p_f_b],
-            [p_b_h, p_b_f, pm_b],
-        ],
-        dtype=float,
-    )
-
-    M = M / M.sum(axis=1, keepdims=True)
+def observation_confusion_matrix(sensor_params: SensorParams) -> np.ndarray:
+    n = sensor_params.n_states
+    pm = float(sensor_params.pm)
+    off = (1.0 - pm) / (n - 1)
+    M = np.full((n, n), off, dtype=float)
+    np.fill_diagonal(M, pm)
     return M
 
 
@@ -749,7 +726,7 @@ def sample_square_fov_observation(
     mask = chebyshev_fov_mask(world_size, robot_xy, sensor_params.fov_radius)
     obs_map = np.full_like(true_state_map, fill_value=-1, dtype=np.int32)
 
-    conf = observation_confusion_matrix(sensor_params.pm)
+    conf = observation_confusion_matrix(sensor_params)
     coords = np.argwhere(mask)
 
     if len(coords) > 0:
@@ -772,7 +749,7 @@ def multi_uav_bayesian_fusion(
     Multiple UAVs fused sequentially (product-of-likelihoods).
     """
     updated = predicted_belief.copy()
-    conf = observation_confusion_matrix(sensor_params.pm)
+    conf = observation_confusion_matrix(sensor_params)
 
     world_size = predicted_belief.shape[0]
     observed_any = np.zeros((world_size, world_size), dtype=bool)
@@ -820,7 +797,7 @@ def mutual_information_map(
     eps: float = 1e-12,
 ) -> np.ndarray:
     """Per-cell mutual information MI(state; observation | belief)."""
-    conf = observation_confusion_matrix(sensor_params.pm)
+    conf = observation_confusion_matrix(sensor_params)
     mi = np.zeros(belief_map.shape[:2], dtype=float)
 
     for y in range(3):
@@ -1926,7 +1903,7 @@ if __name__ == "__main__":
     )
 
     sensor_params = SensorParams(
-        pm=1.0,
+        pm=0.90,
         fov_radius=4,
     )
 
