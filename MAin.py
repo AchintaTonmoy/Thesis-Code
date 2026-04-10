@@ -1930,7 +1930,7 @@ if __name__ == "__main__":
     )
 
     sensor_params = SensorParams(
-        pm=1.0,
+        pm=0.90,
         fov_radius=4,
     )
 
