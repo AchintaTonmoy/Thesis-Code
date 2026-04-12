@@ -339,12 +339,7 @@ def simulate_fire_one_step(
 def initialize_belief(world_size: int, prior=(0.95, 0.03, 0.02)) -> np.ndarray:
     """Create uniform prior belief map.
 
-    Default prior (0.95, 0.03, 0.02) encodes strong but not extreme confidence
-    in HEALTHY.  The log-odds ratio log(P_H/P_F) ≈ 3.5, meaning a single
-    observation with pm=0.85 (LLR ≈ 2.4) reduces it to ~1.1, and two
-    observations overcome the prior entirely.  This is much more responsive
-    than the previous (0.9985, 0.001, 0.0005) prior whose log-odds ≈ 6.9
-    required 3+ observations to overcome.
+  
     """
     belief = np.zeros((world_size, world_size, 3), dtype=float)
     belief[:, :, HEALTHY] = prior[0]
