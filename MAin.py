@@ -85,7 +85,7 @@ class TransitionParams:
 
 @dataclass
 class SensorParams:
-    pm: float = 0.90
+    pm: float = .95
     fov_radius: int = 4
     n_states: int = 3
 
@@ -336,8 +336,16 @@ def simulate_fire_one_step(
 # Belief initialization and belief-front extraction
 # ============================================================
 
-def initialize_belief(world_size: int, prior=(0.9985, 0.0010, 0.0005)) -> np.ndarray:
-    """Create uniform prior belief map."""
+def initialize_belief(world_size: int, prior=(0.95, 0.03, 0.02)) -> np.ndarray:
+    """Create uniform prior belief map.
+
+    Default prior (0.95, 0.03, 0.02) encodes strong but not extreme confidence
+    in HEALTHY.  The log-odds ratio log(P_H/P_F) ≈ 3.5, meaning a single
+    observation with pm=0.85 (LLR ≈ 2.4) reduces it to ~1.1, and two
+    observations overcome the prior entirely.  This is much more responsive
+    than the previous (0.9985, 0.001, 0.0005) prior whose log-odds ≈ 6.9
+    required 3+ observations to overcome.
+    """
     belief = np.zeros((world_size, world_size, 3), dtype=float)
     belief[:, :, HEALTHY] = prior[0]
     belief[:, :, FIRE] = prior[1]
@@ -348,9 +356,14 @@ def initialize_belief(world_size: int, prior=(0.9985, 0.0010, 0.0005)) -> np.nda
 def initialize_belief_from_initial_fire(
     world_size: int,
     initial_fronts: np.ndarray,
-    base_prior=(0.9985, 0.0010, 0.0005),
+    base_prior=(0.95, 0.03, 0.02),
 ) -> np.ndarray:
-    """Seed initial belief using known ignition fronts (e.g. satellite report)."""
+    """Seed initial belief using known ignition fronts (e.g. satellite report).
+
+    The base_prior for non-fire cells matches initialize_belief() defaults.
+    Cells covered by initial ignition fronts get their P(FIRE) set proportional
+    to the normalized intensity, overriding the base prior there.
+    """
     belief = initialize_belief(world_size, prior=base_prior)
 
     if initial_fronts is None or len(initial_fronts) == 0:
@@ -744,33 +757,97 @@ def multi_uav_bayesian_fusion(
     sensor_params: SensorParams,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Standard Bayesian belief update for multiple UAVs.
-    posterior(i,j) ~ predicted_belief(i,j) * P(obs | state)
-    Multiple UAVs fused sequentially (product-of-likelihoods).
+    Bayesian belief update for multiple UAVs using LOG-ODDS representation.
+
+    Standard probability-space Bayes (prior * likelihood / Z) is mathematically
+    correct but numerically fragile when the prior is extreme (e.g. 0.9985 for
+    HEALTHY).  A single observation with pm=0.85 has a likelihood ratio of only
+    ~11.3, which barely dents such a strong prior.  Evidence accumulates
+    multiplicatively in probability space but ADDITIVELY in log-odds space,
+    making log-odds the natural representation for incremental updates.
+
+    For the 3-state case (HEALTHY, FIRE, BURNED) we work with the full
+    log-probability vector rather than the 2-state log-odds scalar.  This is
+    equivalent to Bayesian update but performed in log space:
+
+        log b'(s) = log b(s) + log P(y | s) - log Z
+
+    where Z = sum_s b(s)*P(y|s) is the normalisation constant, computed in
+    log-sum-exp form for numerical stability.
+
+    Additionally, the log-prior contribution is CLAMPED to prevent any single
+    state from dominating the posterior irreversibly.  This is the standard
+    technique from occupancy grid mapping (Thrun et al., Probabilistic Robotics,
+    Ch. 9) adapted for multi-state grids.
+
+    Reference:
+        S. Thrun, W. Burgard, D. Fox, "Probabilistic Robotics", MIT Press, 2005.
+        Chapter 9: Occupancy Grid Mapping, Section 9.2 (log-odds representation).
     """
-    updated = predicted_belief.copy()
+    eps = 1e-12
+
+    # Clamp belief to prevent log(0) and prevent any state from becoming
+    # irrecoverably dominant.  The clamp range [1e-6, 1-1e-6] corresponds
+    # to log-odds limits of approximately +/-13.8, which is well within
+    # float64 precision while still allowing confident beliefs.
+    LOG_ODDS_CLAMP = 13.8  # max |log(p/q)| ≈ log(1e6)
+    PROB_FLOOR = 1e-6
+
+    updated = np.clip(predicted_belief.copy(), PROB_FLOOR, 1.0 - PROB_FLOOR)
+    # Re-normalise after clipping
+    updated = updated / updated.sum(axis=-1, keepdims=True)
+
     conf = observation_confusion_matrix(sensor_params)
+    # Pre-compute log-likelihoods for each possible observation
+    log_conf = np.log(np.maximum(conf, eps))  # shape (n_states, n_states)
 
     world_size = predicted_belief.shape[0]
     observed_any = np.zeros((world_size, world_size), dtype=bool)
     obs_count = np.zeros((world_size, world_size), dtype=np.int32)
 
     for mask_i, obs_map_i in observations:
+        # Vectorised update for all observed cells at once
         coords = np.argwhere(mask_i)
-        for i, j in coords:
-            y_obs = int(obs_map_i[i, j])
-            if y_obs < 0:
-                continue
+        if len(coords) == 0:
+            continue
 
-            likelihood = conf[:, y_obs]
-            posterior = updated[i, j] * likelihood
+        obs_vals = obs_map_i[coords[:, 0], coords[:, 1]]
+        valid = obs_vals >= 0
+        coords = coords[valid]
+        obs_vals = obs_vals[valid]
 
-            s = posterior.sum()
-            if s > 0.0:
-                updated[i, j] = posterior / s
+        if len(coords) == 0:
+            continue
 
-            observed_any[i, j] = True
-            obs_count[i, j] += 1
+        ci, cj = coords[:, 0], coords[:, 1]
+
+        # Current log-beliefs at observed cells: shape (N_obs, 3)
+        log_belief = np.log(np.maximum(updated[ci, cj], eps))
+
+        # Log-likelihood for each observed cell: log P(y_obs | s)
+        # log_conf[:, y_obs] gives the log-likelihood vector for observation y_obs
+        log_lik = log_conf[:, obs_vals].T  # shape (N_obs, 3)
+
+        # Log-space Bayesian update: log_posterior = log_prior + log_likelihood
+        log_post = log_belief + log_lik
+
+        # Clamp log-posterior to prevent numerical extremes
+        # This prevents any state from reaching probabilities so extreme
+        # that future observations cannot overcome the prior
+        log_post_centered = log_post - log_post.max(axis=-1, keepdims=True)
+        log_post_centered = np.clip(log_post_centered, -LOG_ODDS_CLAMP, 0.0)
+
+        # Log-sum-exp normalisation to recover probabilities
+        log_Z = np.log(np.sum(np.exp(log_post_centered), axis=-1, keepdims=True))
+        posterior = np.exp(log_post_centered - log_Z)
+
+        # Floor and re-normalise
+        posterior = np.maximum(posterior, PROB_FLOOR)
+        posterior = posterior / posterior.sum(axis=-1, keepdims=True)
+
+        updated[ci, cj] = posterior
+        observed_any[ci, cj] = True
+        obs_count[ci, cj] += 1
 
     updated = normalize_belief(updated)
     return updated, observed_any, obs_count
@@ -877,12 +954,12 @@ def _phi_pure_single_step(
     sensor_params: SensorParams,
 ) -> np.ndarray:
     """
-    Single-step EID: Phi(x, t) = MI(x, t) + b^F(x, t)
+    Single-step EID: Phi(x, t) = MI(x, t) * b^F(x, t)
     (Coffin et al. ICRA 2022 Eq.9 + Mavrommati et al. 2018)
     """
     mi  = mutual_information_map(belief, sensor_params)
     lam = belief[:, :, FIRE]
-    return mi + lam
+    return mi * lam
 
 
 def target_distribution(
@@ -1522,7 +1599,7 @@ class FinalWildfireMonitoringEnv:
         self.belief_map = initialize_belief_from_initial_fire(
             world_size=n,
             initial_fronts=self.active_fronts,
-            base_prior=(0.9985, 0.0010, 0.0005),
+            base_prior=(0.95, 0.03, 0.02),
         )
 
         # Belief-side fire state (parallel to ground truth, diverges via noise)
@@ -1898,13 +1975,13 @@ if __name__ == "__main__":
         sigma_front_position=0.5,
         sigma_spread_rate=0.15,
         spread_noise_kernel_size=5,
-        belief_diffusion_sigma=1.5,
-        info_decay_rate=0.005,
+        belief_diffusion_sigma=0.6,
+        info_decay_rate=0.002,
     )
 
     sensor_params = SensorParams(
-        pm=0.90,
-        fov_radius=4,
+        pm=.95,
+        fov_radius=8,
     )
 
     planner_params = PlannerParams(
