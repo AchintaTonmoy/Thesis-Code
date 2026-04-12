@@ -85,7 +85,7 @@ class TransitionParams:
 
 @dataclass
 class SensorParams:
-    pm: float = .95
+    pm: float = 1
     fov_radius: int = 4
     n_states: int = 3
 
@@ -339,7 +339,7 @@ def simulate_fire_one_step(
 def initialize_belief(world_size: int, prior=(0.95, 0.03, 0.02)) -> np.ndarray:
     """Create uniform prior belief map.
 
-  
+   
     """
     belief = np.zeros((world_size, world_size, 3), dtype=float)
     belief[:, :, HEALTHY] = prior[0]
@@ -351,7 +351,7 @@ def initialize_belief(world_size: int, prior=(0.95, 0.03, 0.02)) -> np.ndarray:
 def initialize_belief_from_initial_fire(
     world_size: int,
     initial_fronts: np.ndarray,
-    base_prior=(0.95, 0.03, 0.02),
+    base_prior=(0.95, 0.05, 0.02),
 ) -> np.ndarray:
     """Seed initial belief using known ignition fronts (e.g. satellite report).
 
@@ -1345,10 +1345,12 @@ def svgd_optimize_omega(
     neighbor_reference_trajs: Optional[List[np.ndarray]] = None,
     ck_bar_i: Optional[np.ndarray] = None,
     steps_in_memory: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """
     SVGD-based trajectory optimisation over omega sequences.
-    Returns (best_omega, all_particles, particle_variance, best_ck).
+    Returns (best_omega, all_particles, particle_variance, best_ck,
+             svgd_grad_norm) where svgd_grad_norm is the mean squared
+             norm of the final SVGD functional gradient (empirical KSD proxy).
     """
     H = planner_params.horizon
     N = planner_params.num_particles
@@ -1397,6 +1399,10 @@ def svgd_optimize_omega(
         particles = particles + planner_params.step_size * phi_svgd
         particles = np.clip(particles, -planner_params.omega_max, planner_params.omega_max)
 
+    # Retain final functional gradient norm (empirical KSD proxy)
+    # phi_svgd from the last iteration is still in scope
+    final_grad_norm = float(np.mean(np.sum(phi_svgd ** 2, axis=1)))
+
     # Select best particle
     scores = np.zeros((N,), dtype=float)
     local_cks = np.zeros((N, ergodic_cache.num_basis), dtype=float)
@@ -1418,7 +1424,7 @@ def svgd_optimize_omega(
 
     best_idx = int(np.argmin(scores))
     particle_variance = np.var(particles, axis=0)
-    return particles[best_idx].copy(), particles.copy(), particle_variance.copy(), local_cks[best_idx].copy()
+    return particles[best_idx].copy(), particles.copy(), particle_variance.copy(), local_cks[best_idx].copy(), final_grad_norm
 
 
 def shift_omega_horizon(omega_seq: np.ndarray, fill_zero: bool = True) -> np.ndarray:
@@ -1975,7 +1981,7 @@ if __name__ == "__main__":
     )
 
     sensor_params = SensorParams(
-        pm=.95,
+        pm=1,
         fov_radius=8,
     )
 
@@ -2076,7 +2082,7 @@ if __name__ == "__main__":
             neighbor_cks = [consensus_ck_memory[j].copy() for j in range(num_uavs) if j != i]
             neighbor_reference_trajs = [reference_preview_trajs[j] for j in range(num_uavs) if j != i]
 
-            best_omega_seq_i, particles_i, particle_var_i, best_ck_i = svgd_optimize_omega(
+            best_omega_seq_i, particles_i, particle_var_i, best_ck_i, _ = svgd_optimize_omega(
                 x0=obs["robot_states"][i],
                 phi_map=obs["phi_map"],
                 planner_params=planner_params,
