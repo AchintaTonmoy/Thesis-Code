@@ -301,7 +301,7 @@ def simulate_fire_one_step(
     time_vector: np.ndarray,
     geo_phys_info: Dict[str, np.ndarray],
     previous_terrain_map: np.ndarray,
-    decay_rate: float = 0.003,
+    decay_rate: float = 0.00005,
     pruned_points: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run one step of FARSITE propagation + exponential decay."""
@@ -568,35 +568,17 @@ def predict_belief_with_tracked_state(
         return (predicted, z, z,
                 empty3, empty1, empty3, empty3, prev_sm)
 
-    # Step 1: Perturb geo-physical inputs
-    if rng is not None:
-        noisy_geo = perturb_geo_phys_info(
-            geo_phys_info=geo_phys_info,
-            transition_params=transition_params,
-            rng=rng,
-        )
-    else:
-        noisy_geo = geo_phys_info
-
-    # Step 2: Perturb front positions
-    if rng is not None and transition_params.sigma_front_position > 0.0:
-        noisy_fronts = perturb_front_positions(
-            fronts=belief_active_fronts,
-            sigma=transition_params.sigma_front_position,
-            world_size=world_size,
-            rng=rng,
-        )
-    else:
-        noisy_fronts = belief_active_fronts.copy()
-
-    # Step 3: Run FARSITE with noisy inputs (same function as ground truth)
+    # Steps 1-3: Run FARSITE with clean inputs.
+    # No additional additive noise is applied here because
+    # Eq. 15 (Seraj, ACC 2020) already incorporates process
+    # noise ω_t internally within the state-transition model.
     next_belief_fronts, next_belief_time_vector, next_belief_burnt_out = \
         simulate_fire_one_step(
             wildfire_model=wildfire_model,
             world_size=world_size,
-            active_fronts=noisy_fronts,
+            active_fronts=belief_active_fronts.copy(),
             time_vector=belief_time_vector,
-            geo_phys_info=noisy_geo,
+            geo_phys_info=geo_phys_info,
             previous_terrain_map=belief_previous_terrain,
             decay_rate=decay_rate,
             pruned_points=belief_burnt_out_points,
@@ -1534,7 +1516,7 @@ class FinalWildfireMonitoringEnv:
         self._burn_scatter = None
 
         # Fire classification thresholds (shared by ground truth and belief)
-        self.tau_fire = 0.5
+        self.tau_fire = 0.1
         self.tau_burn = 0.08
 
     def reset(
@@ -1544,7 +1526,7 @@ class FinalWildfireMonitoringEnv:
         planner_params: PlannerParams,
         init_states: Optional[np.ndarray] = None,
         num_uavs: Optional[int] = None,
-        decay_rate: float = 0.003,
+        decay_rate: float = 0.00015,
     ):
         self.transition_params = transition_params
         self.sensor_params = sensor_params
@@ -1567,18 +1549,18 @@ class FinalWildfireMonitoringEnv:
         self.wildfire = WildFire(
             terrain_sizes=[n, n],
             hotspot_areas=hotspots,
-            num_ign_points=100,
+            num_ign_points=300,
             duration=self.duration,
             time_step=1,
             radiation_radius=50,
-            weak_fire_threshold=0.05,
+            weak_fire_threshold=0.01,
             flame_height=10,
             flame_angle=np.pi / 3,
         )
 
         self.geo_phys_info = self.wildfire.geo_phys_info_init(
-            max_fuel_coeff=5,
-            avg_wind_speed=2.0,
+            max_fuel_coeff=3,
+            avg_wind_speed=3.0,
             avg_wind_direction=np.pi / 10,
         )
 
@@ -2026,7 +2008,7 @@ if __name__ == "__main__":
         planner_params=planner_params,
         init_states=init_states,
         num_uavs=desired_num_uavs,
-        decay_rate=0.00015,
+        decay_rate=0.00005,
     )
 
     ergodic_cache = ErgodicCache(
