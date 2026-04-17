@@ -24,6 +24,18 @@ num_uavs = 3
 
 
 # ============================================================
+# Numerical precision constant
+# ============================================================
+# NUM_EPS is a float64 precision floor used throughout the module for
+# log(0) guards and normalization-denominator safety.  It is NOT a tuning
+# hyperparameter — it protects floating-point arithmetic and has no
+# effect on the algorithm's behavior for any reasonable probability.
+# Distinct from TransitionParams.eps (1e-6), which is a row-sum threshold
+# for the transition tensor T and IS a declared hyperparameter.
+NUM_EPS: float = 1e-12
+
+
+# ============================================================
 # State encoding (HMM hidden states)
 # ============================================================
 
@@ -75,6 +87,13 @@ class SensorParams:
     pm: float = 0.9
     fov_radius: int = 4
     n_states: int = 3
+
+    # Numerical-stability constants for log-odds Bayesian fusion
+    # (Thrun, Burgard, Fox, "Probabilistic Robotics", MIT Press 2005, Ch. 9).
+    # log_odds_clamp bounds |log(p/q)| to prevent irrecoverably dominant states;
+    # prob_floor prevents log(0) and preserves recoverability of observations.
+    log_odds_clamp: float = 13.8            # ≈ log(1e6); well within float64 precision
+    prob_floor: float = 1e-6                # min per-state probability
 
     def __post_init__(self):
         if not 0.0 < self.pm <= 1.0:
@@ -229,7 +248,7 @@ def wrap_angle(theta: float) -> float:
     return (theta + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def normalize_belief(belief: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+def normalize_belief(belief: np.ndarray, eps: float = NUM_EPS) -> np.ndarray:
     """Normalize belief so each cell sums to 1 across states."""
     denom = np.sum(belief, axis=-1, keepdims=True)
     denom = np.maximum(denom, eps)
@@ -576,7 +595,7 @@ def predict_belief_with_tracked_state(
             fire_mass_before = float(np.sum(predF))
             predF = gaussian_filter(predF, sigma=sigma_diff)
             fire_mass_after = float(np.sum(predF))
-            if fire_mass_after > 1e-12:
+            if fire_mass_after > NUM_EPS:
                 predF *= (fire_mass_before / fire_mass_after)
         except ImportError:
             pass
@@ -688,14 +707,14 @@ def multi_uav_bayesian_fusion(
         S. Thrun, W. Burgard, D. Fox, "Probabilistic Robotics", MIT Press, 2005.
         Chapter 9: Occupancy Grid Mapping, Section 9.2 (log-odds representation).
     """
-    eps = 1e-12
+    eps = NUM_EPS
 
-    # Clamp belief to prevent log(0) and prevent any state from becoming
-    # irrecoverably dominant.  The clamp range [1e-6, 1-1e-6] corresponds
-    # to log-odds limits of approximately +/-13.8, which is well within
-    # float64 precision while still allowing confident beliefs.
-    LOG_ODDS_CLAMP = 13.8  # max |log(p/q)| ≈ log(1e6)
-    PROB_FLOOR = 1e-6
+    # Numerical-stability bounds sourced from SensorParams (single source of
+    # truth).  prob_floor prevents log(0) and irrecoverable 0/1 beliefs;
+    # log_odds_clamp bounds |log(p/q)| to keep posteriors recoverable under
+    # future observations.
+    LOG_ODDS_CLAMP = float(sensor_params.log_odds_clamp)
+    PROB_FLOOR = float(sensor_params.prob_floor)
 
     updated = np.clip(predicted_belief.copy(), PROB_FLOOR, 1.0 - PROB_FLOOR)
     # Re-normalise after clipping
@@ -766,7 +785,7 @@ def burning_belief_map(belief_map: np.ndarray) -> np.ndarray:
     return belief_map[:, :, FIRE].copy()
 
 
-def entropy_map(belief_map: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+def entropy_map(belief_map: np.ndarray, eps: float = NUM_EPS) -> np.ndarray:
     """Per-cell Shannon entropy H(b) = -sum p*log(p)."""
     p = np.clip(belief_map, eps, 1.0)
     return -np.sum(p * np.log(p), axis=-1)
@@ -775,7 +794,7 @@ def entropy_map(belief_map: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 def mutual_information_map(
     belief_map: np.ndarray,
     sensor_params: SensorParams,
-    eps: float = 1e-12,
+    eps: float = NUM_EPS,
 ) -> np.ndarray:
     """Per-cell mutual information MI(state; observation | belief)."""
     conf = observation_confusion_matrix(sensor_params)
@@ -1764,7 +1783,7 @@ class FinalWildfireMonitoringEnv:
         phi_min = float(np.min(phi_show))
         phi_max = float(np.max(phi_show))
         if phi_max - phi_min < 1e-15:
-            self._im0.set_clim(vmin=0.0, vmax=max(phi_max, 1e-12))
+            self._im0.set_clim(vmin=0.0, vmax=max(phi_max, NUM_EPS))
         else:
             self._im0.set_clim(vmin=phi_min, vmax=phi_max)
 
@@ -1865,6 +1884,8 @@ if __name__ == "__main__":
     sensor_params = SensorParams(
         pm=0.95,
         fov_radius=8,
+        log_odds_clamp=13.8,
+        prob_floor=1e-6,
     )
 
     planner_params = PlannerParams(
