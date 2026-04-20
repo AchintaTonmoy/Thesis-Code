@@ -66,7 +66,7 @@ class TransitionParams:
 
     # Fire-state classification thresholds (shared by ground truth and belief)
     tau_fire: float = 0.10                  # intensity > tau_fire → FIRE
-    tau_burn: float = 0.08                  # prev=FIRE & intensity < tau_burn → BURNED
+    tau_burn: float = 0.05                  # prev=FIRE & intensity < tau_burn → BURNED
 
     eps: float = 1e-6
 
@@ -167,21 +167,21 @@ class FireParams:
     """Fire physics / simulator configuration (FireCommander + hotspots)."""
 
     # WildFire simulator constants
-    num_ign_points: int = 300
-    radiation_radius: float = 50.0
+    num_ign_points: int = 600
+    radiation_radius: float = 80.0
     weak_fire_threshold: float = 0.01
     flame_height: float = 10.0
     flame_angle: float = np.pi / 3
 
     # Ignition hotspot geometry
-    hotspot_patch_size: int = 10
+    hotspot_patch_size: int = 5
     hotspot_min_separation: float = 5.0
     hotspot_border_margin: int = 10
 
     # Ground-truth fire dynamics (passed to geo_phys_info_init)
     decay_rate: float = 0.00005
-    max_fuel_coeff: float = 1.0
-    avg_wind_speed: float = 2.0
+    max_fuel_coeff: float = 3.0
+    avg_wind_speed: float = 4.0
     avg_wind_direction: float = np.pi / 10
 
     # Initial belief seeding prior (HEALTHY, FIRE, BURNED)
@@ -1933,7 +1933,7 @@ if __name__ == "__main__":
         hotspot_patch_size=10,
         hotspot_min_separation=5.0,
         hotspot_border_margin=10,
-        decay_rate=0.00005,
+        decay_rate=0.000005,
         max_fuel_coeff=1.0,
         avg_wind_speed=2.0,
         avg_wind_direction=np.pi / 10,
