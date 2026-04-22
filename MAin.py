@@ -26,12 +26,6 @@ num_uavs = 3
 # ============================================================
 # Numerical precision constant
 # ============================================================
-# NUM_EPS is a float64 precision floor used throughout the module for
-# log(0) guards and normalization-denominator safety.  It is NOT a tuning
-# hyperparameter — it protects floating-point arithmetic and has no
-# effect on the algorithm's behavior for any reasonable probability.
-# Distinct from TransitionParams.eps (1e-6), which is a row-sum threshold
-# for the transition tensor T and IS a declared hyperparameter.
 NUM_EPS: float = 1e-12
 
 
@@ -60,25 +54,15 @@ UAV_COLORS = ["white", "cyan", "magenta", "yellow", "lime", "orange"]
 class TransitionParams:
     """Parameters for HMM belief transition."""
 
-    # Belief seeding from initial ignition
-    belief_seed_cap: float = 0.98           # upper cap on seeded P(FIRE)
-    belief_seed_floor: float = 0.015        # values below this → 0
+    belief_seed_cap: float = 0.98
+    belief_seed_floor: float = 0.015
 
-    # Fire-state classification thresholds (shared by ground truth and belief)
-    tau_fire: float = 0.10                  # intensity > tau_fire → FIRE
-    tau_burn: float = 0.05                  # prev=FIRE & intensity < tau_burn → BURNED
+    tau_fire: float = 0.10
+    tau_burn: float = 0.05
 
     eps: float = 1e-6
 
-    # Process noise ω_t (Seraj & Gombolay ACC 2020, Eq.15), realized as a
-    # mass-preserving Gaussian diffusion on the predicted P(FIRE) map.
-    # Equivalent to additive position noise ω_t ~ N(0, σ²I) on front
-    # positions before rasterization, but computed directly in belief space.
-    # Input-space parameter noise is NOT used (would double-count ω_t).
-    belief_diffusion_sigma: float = 0.8
-
     # Information decay: unobserved cells mix toward max entropy [1/3,1/3,1/3]
-    # at rate lambda per step.  b(i,j) <- (1-lam)*b(i,j) + lam*[1/3,1/3,1/3]
     info_decay_rate: float = 0.001
 
 
@@ -88,12 +72,8 @@ class SensorParams:
     fov_radius: int = 4
     n_states: int = 3
 
-    # Numerical-stability constants for log-odds Bayesian fusion
-    # (Thrun, Burgard, Fox, "Probabilistic Robotics", MIT Press 2005, Ch. 9).
-    # log_odds_clamp bounds |log(p/q)| to prevent irrecoverably dominant states;
-    # prob_floor prevents log(0) and preserves recoverability of observations.
-    log_odds_clamp: float = 13.8            # ≈ log(1e6); well within float64 precision
-    prob_floor: float = 1e-6                # min per-state probability
+    log_odds_clamp: float = 13.8
+    prob_floor: float = 1e-6
 
     def __post_init__(self):
         if not 0.0 < self.pm <= 1.0:
@@ -111,80 +91,59 @@ class PlannerParams:
     bandwidth: float = 2.0
     dt: float = 1.0
 
-    # Unicycle dynamics
     v0: float = 4.0
     omega_max: float = 0.60
 
-    # Fourier basis order for ergodic metric
     basis_order_x: int = 5
     basis_order_y: int = 5
     ergodic_lambda: float = 1.0
     fd_eps: float = 5e-3
 
-    # Control-effort regularizer: J_u = control_effort_weight * Σ ω²
     control_effort_weight: float = 1e-3
 
-    # Gaussian prior on controls: p(omega) = N(0, sigma^2 I)
     omega_prior_sigma: float = 0.60
     prior_weight: float = 0.10
 
-    # SVGD particle initialization noise scales
-    svgd_init_sigma: float = 0.15           # std for cold-start particles
-    svgd_warmstart_jitter: float = 0.05     # std added around warm-start
+    svgd_init_sigma: float = 0.15
+    svgd_warmstart_jitter: float = 0.05
 
-    # Inter-agent separation: quadratic hinge soft-constraint
     separation_distance: float = 8.0
     separation_weight: float = 0.02
 
-    # Boundary wall avoidance: quadratic hinge soft-constraint
     boundary_distance: float = 5.0
     boundary_weight: float   = 0.05
 
-    # Decentralized coefficient-sharing consensus rounds
     consensus_rounds: int = 2
 
-    # EID regularization kernel (Gaussian smoothing of the EID before
-    # ergodic planning; independent of the actual sensor footprint size)
     smooth_kernel_size: float = 5
     smooth_sigma: float = 1.0
 
-    # Temporal EMA on EID: φ_t = α·φ_raw + (1-α)·φ_{t-1}
-    # Set to 1.0 to disable (use raw EID directly).
-    # half_life = log(0.5) / log(1-α)
     phi_ema_alpha: float = 0.15
 
-    # Initial UAV deployment offset from world boundary (cells)
     init_boundary_margin: float = 5.0
 
-    # Ergodic memory horizon multiplier: M_erg = memory_horizon_multiplier * horizon
-    # (Mavrommati 2018 ergodic memory window, bounded to avoid unbounded
-    # accumulation while remaining at least as long as the plan.)
     memory_horizon_multiplier: float = 2.0
 
 
 @dataclass
 class FireParams:
-    """Fire physics / simulator configuration (FireCommander + hotspots)."""
+    """Fire physics / simulator configuration."""
 
-    # WildFire simulator constants
     num_ign_points: int = 600
     radiation_radius: float = 80.0
     weak_fire_threshold: float = 0.01
     flame_height: float = 10.0
     flame_angle: float = np.pi / 3
 
-    # Ignition hotspot geometry
     hotspot_patch_size: int = 5
     hotspot_min_separation: float = 5.0
     hotspot_border_margin: int = 10
 
-    # Ground-truth fire dynamics (passed to geo_phys_info_init)
     decay_rate: float = 0.00005
     max_fuel_coeff: float = 3.0
     avg_wind_speed: float = 4.0
     avg_wind_direction: float = np.pi / 10
 
-    # Initial belief seeding prior (HEALTHY, FIRE, BURNED)
     base_prior: Tuple[float, float, float] = (0.95, 0.03, 0.02)
 
 
@@ -193,17 +152,6 @@ def generate_uav_initial_states(
     map_size: int,
     boundary_margin: float = 5.0,
 ) -> np.ndarray:
-    """
-    Deploy UAVs evenly along the map boundary facing inward.
-    Returns shape (num_uavs, 3) => [x, y, theta].
-
-    Args:
-        num_uavs: number of agents
-        map_size: world size (assumed square)
-        boundary_margin: offset from world boundary (cells). Should be supplied
-            from PlannerParams.init_boundary_margin at call site so there is no
-            hidden initialization constant in the pipeline.
-    """
     states = []
     margin = float(boundary_margin)
 
@@ -237,19 +185,16 @@ def generate_uav_initial_states(
 # ============================================================
 
 def clip_xy(x: float, y: float, world_size: int) -> Tuple[float, float]:
-    """Clip (x, y) to valid grid range [0, world_size-1]."""
     x = float(np.clip(x, 0.0, world_size - 1.0))
     y = float(np.clip(y, 0.0, world_size - 1.0))
     return x, y
 
 
 def wrap_angle(theta: float) -> float:
-    """Wrap angle to [-pi, pi]."""
     return (theta + np.pi) % (2.0 * np.pi) - np.pi
 
 
 def normalize_belief(belief: np.ndarray, eps: float = NUM_EPS) -> np.ndarray:
-    """Normalize belief so each cell sums to 1 across states."""
     denom = np.sum(belief, axis=-1, keepdims=True)
     denom = np.maximum(denom, eps)
     return belief / denom
@@ -265,7 +210,6 @@ def observation_confusion_matrix(sensor_params: SensorParams) -> np.ndarray:
 
 
 def belief_to_display_state(belief_map: np.ndarray) -> np.ndarray:
-    """Convert belief to hard state map via argmax for display."""
     return np.argmax(belief_map, axis=-1).astype(np.int32)
 
 
@@ -277,7 +221,6 @@ def generate_random_hotspots(
     border_margin: int,
     rng: np.random.Generator,
 ) -> List[List[int]]:
-    """Generate separated ignition regions as [x_min, x_max, y_min, y_max]."""
     hotspots: List[List[int]] = []
     centers: List[Tuple[float, float]] = []
 
@@ -313,7 +256,6 @@ def generate_random_hotspots(
 # ============================================================
 
 def rasterize_intensity(points_xyz: np.ndarray, n: int) -> np.ndarray:
-    """Rasterize (x, y, intensity) points onto an n x n grid using max-at."""
     I = np.zeros((n, n), dtype=float)
     if points_xyz is None or len(points_xyz) == 0:
         return I
@@ -333,7 +275,6 @@ def intensity_to_state_map(
     tau_fire: float,
     tau_burn: float,
 ) -> np.ndarray:
-    """Classify each cell as HEALTHY/FIRE/BURNED based on intensity thresholds."""
     state_map = np.full(intensity_map.shape, HEALTHY, dtype=np.int32)
 
     if prev_state_map is None:
@@ -352,7 +293,6 @@ def intensity_to_state_map(
 # ============================================================
 
 def _safe_pruned_list(pruned_points: Optional[np.ndarray]) -> List[List[int]]:
-    """Convert pruned points array to list-of-lists for fire_propagation()."""
     if pruned_points is None or len(pruned_points) == 0:
         return []
     return [[int(round(float(p[0]))), int(round(float(p[1])))] for p in pruned_points]
@@ -368,12 +308,6 @@ def simulate_fire_one_step(
     decay_rate: float,
     pruned_points: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run one step of FARSITE propagation + exponential decay.
-
-    decay_rate is required (no default) so that FireParams.decay_rate is the
-    single source of truth for this physical constant. This prevents silent
-    drift from a stale shadow default if a caller ever forgets the kwarg.
-    """
     if active_fronts is None or len(active_fronts) == 0:
         return (
             np.zeros((0, 3), dtype=float),
@@ -406,10 +340,6 @@ def simulate_fire_one_step(
 # ============================================================
 
 def initialize_belief(world_size: int, prior=(0.95, 0.03, 0.02)) -> np.ndarray:
-    """Create uniform prior belief map.
-
-   
-    """
     belief = np.zeros((world_size, world_size, 3), dtype=float)
     belief[:, :, HEALTHY] = prior[0]
     belief[:, :, FIRE] = prior[1]
@@ -424,11 +354,6 @@ def initialize_belief_from_initial_fire(
     seed_cap: float = 0.98,
     seed_floor: float = 0.015,
 ) -> np.ndarray:
-    """Seed initial belief using known ignition fronts (e.g. satellite report).
-
-    Cells covered by initial ignition fronts get P(FIRE) set proportional
-    to the normalized intensity, capped at seed_cap and floored at seed_floor.
-    """
     belief = initialize_belief(world_size, prior=base_prior)
 
     if initial_fronts is None or len(initial_fronts) == 0:
@@ -455,7 +380,7 @@ def initialize_belief_from_initial_fire(
 
 
 # ============================================================
-# Belief transition (deterministic FARSITE + probability-space ω_t)
+# Belief transition (deterministic FARSITE only, no additive noise)
 # ============================================================
 
 def predict_belief_with_tracked_state(
@@ -476,12 +401,11 @@ def predict_belief_with_tracked_state(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Predict next belief using the same FARSITE model as ground truth.
+    Predict next belief using the same deterministic FARSITE model as ground truth.
 
-    Process noise ω_t (Seraj & Gombolay ACC 2020, Eq.15) is realized at
-    step 8 as a mass-preserving Gaussian diffusion on the predicted
-    P(FIRE) map, not as input-space parameter noise (which would
-    double-count ω_t).
+    No additional process noise is applied — the internal stochasticity of
+    FARSITE (random wind draws, Gaussian intensity deviations) already provides
+    the natural process noise, exactly matching the ground-truth simulator.
 
     Pipeline:
       1-3. simulate_fire_one_step() — deterministic FARSITE propagation
@@ -489,7 +413,6 @@ def predict_belief_with_tracked_state(
       5.   Classify into state map
       6.   Build per-cell transition tensor T
       7.   Chapman-Kolmogorov: b'(s') = sum_s b(s) * T(s'|s)
-      8.   Apply ω_t: mass-preserving Gaussian diffusion on P(FIRE)
 
     Returns: (predicted_belief, pred_active_raster, pred_burnt_raster,
               next_fronts, next_time_vec, next_burnt_out, next_prev_terrain,
@@ -515,8 +438,7 @@ def predict_belief_with_tracked_state(
         return (predicted, z, z,
                 empty3, empty1, empty3, empty3, prev_sm)
 
-    # Steps 1-3: Deterministic FARSITE propagation. Process noise ω_t is
-    # applied at step 8 below as Gaussian diffusion on P(FIRE).
+    # Steps 1-3: Deterministic FARSITE propagation
     next_belief_fronts, next_belief_time_vector, next_belief_burnt_out = \
         simulate_fire_one_step(
             wildfire_model=wildfire_model,
@@ -586,20 +508,6 @@ def predict_belief_with_tracked_state(
         + pB * T[:, :, BURNED, BURNED]
     )
 
-    # Step 8: Apply process noise ω_t (Seraj & Gombolay ACC 2020, Eq.15) as
-    # mass-preserving Gaussian diffusion on P(FIRE).
-    sigma_diff = transition_params.belief_diffusion_sigma
-    if sigma_diff > 0.0:
-        try:
-            from scipy.ndimage import gaussian_filter
-            fire_mass_before = float(np.sum(predF))
-            predF = gaussian_filter(predF, sigma=sigma_diff)
-            fire_mass_after = float(np.sum(predF))
-            if fire_mass_after > NUM_EPS:
-                predF *= (fire_mass_before / fire_mass_after)
-        except ImportError:
-            pass
-
     predicted = np.stack([predH, predF, predB], axis=-1)
     predicted = normalize_belief(predicted)
 
@@ -611,7 +519,6 @@ def predict_belief_with_tracked_state(
     pred_burnt_norm  = (pred_burnt_raster_raw  / max(burnt_max,  eps)) if burnt_max  > 0.0 \
                        else np.zeros_like(pred_burnt_raster_raw)
 
-    # Update belief-side previous terrain (mirrors ground truth)
     next_belief_prev_terrain = (
         next_belief_fronts.copy() if len(next_belief_fronts) > 0
         else np.zeros((0, 3), dtype=float)
@@ -628,7 +535,6 @@ def predict_belief_with_tracked_state(
 # ============================================================
 
 def containing_cell_from_position(robot_xy: Sequence[float], world_size: int) -> Tuple[int, int]:
-    """Map continuous position to discrete grid cell."""
     x = float(robot_xy[0])
     y = float(robot_xy[1])
     i = int(np.floor(np.clip(x, 0.0, world_size - 1.0)))
@@ -637,7 +543,6 @@ def containing_cell_from_position(robot_xy: Sequence[float], world_size: int) ->
 
 
 def chebyshev_fov_mask(world_size: int, robot_xy: Sequence[float], fov_radius: int) -> np.ndarray:
-    """Create square FOV boolean mask centred on robot position."""
     i, j = containing_cell_from_position(robot_xy, world_size)
 
     mask = np.zeros((world_size, world_size), dtype=bool)
@@ -657,7 +562,6 @@ def sample_square_fov_observation(
     sensor_params: SensorParams,
     rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Sample noisy observations within the FOV using the confusion matrix."""
     world_size = true_state_map.shape[0]
     mask = chebyshev_fov_mask(world_size, robot_xy, sensor_params.fov_radius)
     obs_map = np.full_like(true_state_map, fill_value=-1, dtype=np.int32)
@@ -681,55 +585,24 @@ def multi_uav_bayesian_fusion(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Bayesian belief update for multiple UAVs using LOG-ODDS representation.
-
-    Standard probability-space Bayes (prior * likelihood / Z) is mathematically
-    correct but numerically fragile when the prior is extreme (e.g. 0.9985 for
-    HEALTHY).  A single observation with pm=0.85 has a likelihood ratio of only
-    ~11.3, which barely dents such a strong prior.  Evidence accumulates
-    multiplicatively in probability space but ADDITIVELY in log-odds space,
-    making log-odds the natural representation for incremental updates.
-
-    For the 3-state case (HEALTHY, FIRE, BURNED) we work with the full
-    log-probability vector rather than the 2-state log-odds scalar.  This is
-    equivalent to Bayesian update but performed in log space:
-
-        log b'(s) = log b(s) + log P(y | s) - log Z
-
-    where Z = sum_s b(s)*P(y|s) is the normalisation constant, computed in
-    log-sum-exp form for numerical stability.
-
-    Additionally, the log-prior contribution is CLAMPED to prevent any single
-    state from dominating the posterior irreversibly.  This is the standard
-    technique from occupancy grid mapping (Thrun et al., Probabilistic Robotics,
-    Ch. 9) adapted for multi-state grids.
-
-    Reference:
-        S. Thrun, W. Burgard, D. Fox, "Probabilistic Robotics", MIT Press, 2005.
-        Chapter 9: Occupancy Grid Mapping, Section 9.2 (log-odds representation).
+    (Thrun, Burgard, Fox, "Probabilistic Robotics", MIT Press 2005, Ch. 9)
     """
     eps = NUM_EPS
 
-    # Numerical-stability bounds sourced from SensorParams (single source of
-    # truth).  prob_floor prevents log(0) and irrecoverable 0/1 beliefs;
-    # log_odds_clamp bounds |log(p/q)| to keep posteriors recoverable under
-    # future observations.
     LOG_ODDS_CLAMP = float(sensor_params.log_odds_clamp)
     PROB_FLOOR = float(sensor_params.prob_floor)
 
     updated = np.clip(predicted_belief.copy(), PROB_FLOOR, 1.0 - PROB_FLOOR)
-    # Re-normalise after clipping
     updated = updated / updated.sum(axis=-1, keepdims=True)
 
     conf = observation_confusion_matrix(sensor_params)
-    # Pre-compute log-likelihoods for each possible observation
-    log_conf = np.log(np.maximum(conf, eps))  # shape (n_states, n_states)
+    log_conf = np.log(np.maximum(conf, eps))
 
     world_size = predicted_belief.shape[0]
     observed_any = np.zeros((world_size, world_size), dtype=bool)
     obs_count = np.zeros((world_size, world_size), dtype=np.int32)
 
     for mask_i, obs_map_i in observations:
-        # Vectorised update for all observed cells at once
         coords = np.argwhere(mask_i)
         if len(coords) == 0:
             continue
@@ -744,27 +617,17 @@ def multi_uav_bayesian_fusion(
 
         ci, cj = coords[:, 0], coords[:, 1]
 
-        # Current log-beliefs at observed cells: shape (N_obs, 3)
         log_belief = np.log(np.maximum(updated[ci, cj], eps))
+        log_lik = log_conf[:, obs_vals].T
 
-        # Log-likelihood for each observed cell: log P(y_obs | s)
-        # log_conf[:, y_obs] gives the log-likelihood vector for observation y_obs
-        log_lik = log_conf[:, obs_vals].T  # shape (N_obs, 3)
-
-        # Log-space Bayesian update: log_posterior = log_prior + log_likelihood
         log_post = log_belief + log_lik
 
-        # Clamp log-posterior to prevent numerical extremes
-        # This prevents any state from reaching probabilities so extreme
-        # that future observations cannot overcome the prior
         log_post_centered = log_post - log_post.max(axis=-1, keepdims=True)
         log_post_centered = np.clip(log_post_centered, -LOG_ODDS_CLAMP, 0.0)
 
-        # Log-sum-exp normalisation to recover probabilities
         log_Z = np.log(np.sum(np.exp(log_post_centered), axis=-1, keepdims=True))
         posterior = np.exp(log_post_centered - log_Z)
 
-        # Floor and re-normalise
         posterior = np.maximum(posterior, PROB_FLOOR)
         posterior = posterior / posterior.sum(axis=-1, keepdims=True)
 
@@ -781,12 +644,10 @@ def multi_uav_bayesian_fusion(
 # ============================================================
 
 def burning_belief_map(belief_map: np.ndarray) -> np.ndarray:
-    """Extract P(FIRE) layer from belief."""
     return belief_map[:, :, FIRE].copy()
 
 
 def entropy_map(belief_map: np.ndarray, eps: float = NUM_EPS) -> np.ndarray:
-    """Per-cell Shannon entropy H(b) = -sum p*log(p)."""
     p = np.clip(belief_map, eps, 1.0)
     return -np.sum(p * np.log(p), axis=-1)
 
@@ -796,7 +657,6 @@ def mutual_information_map(
     sensor_params: SensorParams,
     eps: float = NUM_EPS,
 ) -> np.ndarray:
-    """Per-cell mutual information MI(state; observation | belief)."""
     conf = observation_confusion_matrix(sensor_params)
     mi = np.zeros(belief_map.shape[:2], dtype=float)
 
@@ -812,7 +672,6 @@ def mutual_information_map(
 
 
 def gaussian_kernel(size: int = 5, sigma: float = 1.0) -> np.ndarray:
-    """Build a normalised 2D Gaussian kernel."""
     if size % 2 == 0:
         size += 1
     ax = np.arange(-(size // 2), size // 2 + 1, dtype=float)
@@ -823,7 +682,6 @@ def gaussian_kernel(size: int = 5, sigma: float = 1.0) -> np.ndarray:
 
 
 def smooth_map(map2d: np.ndarray, size: int = 5, sigma: float = 1.0) -> np.ndarray:
-    """Gaussian smoothing via scipy convolution."""
     from scipy.ndimage import convolve
     K = gaussian_kernel(size=size, sigma=sigma)
     return convolve(map2d.astype(float), K, mode="nearest")
@@ -833,11 +691,6 @@ def _phi_pure_single_step(
     belief: np.ndarray,
     sensor_params: SensorParams,
 ) -> np.ndarray:
-    """
-    Single-step EID: Phi(x, t) = MI(x, t) * P(FIRE | x, t).
-    Fire-weighted mutual information; MI term follows Miller & Murphey
-    TRO 2016 (EEDI).
-    """
     mi  = mutual_information_map(belief, sensor_params)
     lam = belief[:, :, FIRE]
     return mi * lam
@@ -849,39 +702,15 @@ def target_distribution(
     planner_params: PlannerParams,
     pred_belief_map: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute horizon-averaged EID for the ergodic planner.
-
-    Because ``pred_belief_map`` is the 1-step-ahead predicted belief (not the
-    H-step-ahead rollout), we approximate the over-horizon EID by piecewise-
-    linear interpolation between the current belief b_t and the 1-step-ahead
-    belief b_{t+1}:
-
-        b_s(x) = (1 - s/H) * b_t(x) + (s/H) * b_{t+1}(x),    s = 0, 1, ..., H
-
-        Phi_avg(x) = (1/(H+1)) * sum_{s=0}^{H} Phi(b_s)
-
-    This is a 1-step predictive average, not a true H-step rollout average.
-    It preserves the interpretation that early samples are closer to the
-    present belief and late samples are closer to the predicted belief,
-    without requiring H forward FARSITE integrations per planning cycle.
-    After averaging, the EID is smoothed with a Gaussian sensor footprint
-    kernel and normalised to a pdf.
-
-    Returns: (lambda_map, sigma_map, mi_map, psi_map, phi_normalised)
-    """
     H = planner_params.horizon
 
-    # Logging quantities from current step
     lambda_map = belief_map[:, :, FIRE].copy()
     sigma_map  = entropy_map(belief_map)
     mi_map     = mutual_information_map(belief_map, sensor_params)
 
-    # Step s=0: current belief EID
     phi_acc = _phi_pure_single_step(belief_map, sensor_params).copy()
     num_steps = 1
 
-    # Steps s=1..H: linearly interpolated beliefs
     if pred_belief_map is not None and pred_belief_map.shape == belief_map.shape:
         for s in range(1, H + 1):
             alpha = float(s) / float(H)
@@ -892,10 +721,8 @@ def target_distribution(
             phi_acc += _phi_pure_single_step(interp_belief, sensor_params)
             num_steps += 1
 
-    # Horizon average
     psi_map = phi_acc / float(num_steps)
 
-    # Sensor footprint smoothing + normalise to pdf
     phi_smooth = smooth_map(
         psi_map,
         size=planner_params.smooth_kernel_size,
@@ -916,11 +743,6 @@ def target_distribution(
 # ============================================================
 
 class ErgodicCache:
-    """
-    Pre-computes cosine basis functions, spectral weights, and normalisation
-    factors for efficient ergodic metric evaluation.
-    (Mathew & Mezic 2011; Mavrommati et al. 2018 Eq.4)
-    """
     def __init__(self, world_size_x: int, world_size_y: int, order_x: int, order_y: int):
         self.nx = world_size_x
         self.ny = world_size_y
@@ -933,7 +755,6 @@ class ErgodicCache:
         xs = np.arange(self.nx, dtype=float)
         ys = np.arange(self.ny, dtype=float)
 
-        # Cosine basis: cos(k * pi * x / L) for each frequency
         self.basis_x = np.stack(
             [np.cos(kx * np.pi * xs / self.nx) for kx in range(order_x)],
             axis=0,
@@ -943,7 +764,6 @@ class ErgodicCache:
             axis=0,
         )
 
-        # Spectral weights: Lambda_k = (1 + ||k||^2)^(-3/2)
         self.spectral_weights = np.array(
             [(1.0 + kx * kx + ky * ky) ** (-1.5) for (kx, ky) in self.k_list],
             dtype=float,
@@ -952,7 +772,6 @@ class ErgodicCache:
         self._kx_idx = np.array([kx for kx, _ in self.k_list], dtype=int)
         self._ky_idx = np.array([ky for _, ky in self.k_list], dtype=int)
 
-        # Normalisation factors h_k: h_k = prod_i sqrt(1 + delta_{k_i,0})
         self._hk = np.array(
             [
                 (np.sqrt(2.0) if kx == 0 else 1.0) * (np.sqrt(2.0) if ky == 0 else 1.0)
@@ -961,7 +780,6 @@ class ErgodicCache:
             dtype=float,
         )
 
-        # Pre-built basis tensors: F_k(i,j) = (1/h_k)*cos(kx*pi*i/nx)*cos(ky*pi*j/ny)
         self._basis_outer = np.stack(
             [
                 np.outer(self.basis_x[kx], self.basis_y[ky]) / hk
@@ -971,11 +789,9 @@ class ErgodicCache:
         )
 
     def phi_fourier_coefficients(self, phi_map: np.ndarray) -> np.ndarray:
-        """Compute phi_k = sum_{i,j} phi(i,j) * F_k(i,j)."""
         return np.einsum('kij,ij->k', self._basis_outer, phi_map)
 
     def trajectory_fourier_coefficients(self, traj_xy: np.ndarray) -> np.ndarray:
-        """Compute c_k = (1/T) sum_t F_k(x(t)) for a trajectory."""
         if len(traj_xy) == 0:
             return np.zeros((self.K,), dtype=float)
 
@@ -991,7 +807,6 @@ class ErgodicCache:
         return raw / self._hk
 
     def ergodic_metric(self, traj_xy: np.ndarray, phi_map: np.ndarray) -> float:
-        """E = sum_k Lambda_k * (c_k - phi_k)^2."""
         phi_k = self.phi_fourier_coefficients(phi_map)
         c_k = self.trajectory_fourier_coefficients(traj_xy)
         return float(np.sum(self.spectral_weights * (c_k - phi_k) ** 2))
@@ -1002,7 +817,6 @@ class ErgodicCache:
         phi_map: np.ndarray,
         neighbor_cks: Optional[List[np.ndarray]] = None,
     ) -> float:
-        """Team ergodic metric using averaged coefficients from all agents."""
         phi_k = self.phi_fourier_coefficients(phi_map)
         all_ck = [np.asarray(local_ck, dtype=float)]
         if neighbor_cks:
@@ -1019,7 +833,6 @@ class ErgodicCache:
         phi_map: np.ndarray,
         neighbor_cks: Optional[List[np.ndarray]] = None,
     ) -> float:
-        """Convenience: compute local c_k from trajectory, then team metric."""
         local_ck = self.trajectory_fourier_coefficients(traj_xy)
         return self.team_ergodic_metric_from_coefficients(
             local_ck=local_ck,
@@ -1039,7 +852,6 @@ def rollout_unicycle(
     world_size: int,
     v0: float,
 ) -> np.ndarray:
-    """Forward-simulate unicycle: x' = x + v0*cos(theta)*dt, etc."""
     state = np.asarray(x0, dtype=float).copy()
     traj = [state.copy()]
 
@@ -1056,7 +868,6 @@ def rollout_unicycle(
 
 
 def omega_cost(omega_seq: np.ndarray, weight: float) -> float:
-    """Control effort penalty: weight * sum(omega^2)."""
     return float(weight * np.sum(omega_seq ** 2))
 
 
@@ -1066,14 +877,8 @@ def inequality_constraint_penalty(
     planner_params: PlannerParams,
     other_trajs_xy: Optional[List[np.ndarray]] = None,
 ) -> float:
-    """
-    Quadratic hinge soft-constraint penalty:
-      - Inter-agent separation: c_sep * max(0, d_min - d_ij)^2
-      - Boundary avoidance:     c_wall * max(0, d_margin - d_wall)^2
-    """
     total = 0.0
 
-    # Inter-agent separation
     if other_trajs_xy is not None and planner_params.separation_weight > 0.0:
         for other in other_trajs_xy:
             T = min(len(traj_xy), len(other))
@@ -1083,7 +888,6 @@ def inequality_constraint_penalty(
             viol = np.maximum(planner_params.separation_distance - d, 0.0)
             total += planner_params.separation_weight * float(np.sum(viol ** 2))
 
-    # Boundary wall avoidance
     if planner_params.boundary_weight > 0.0 and len(traj_xy) > 0:
         x   = traj_xy[:, 0]
         y   = traj_xy[:, 1]
@@ -1102,7 +906,6 @@ def fully_connected_ck_consensus(
     local_ck_matrix: np.ndarray,
     rounds: int = 1,
 ) -> np.ndarray:
-    """Fully connected consensus: each agent averages all agents' c_k vectors."""
     ck = np.asarray(local_ck_matrix, dtype=float).copy()
     if ck.ndim != 2:
         raise ValueError("local_ck_matrix must be shaped [num_uavs, num_basis].")
@@ -1129,7 +932,6 @@ def objective_of_omega(
     ck_bar_i: Optional[np.ndarray] = None,
     steps_in_memory: int = 0,
 ) -> float | Tuple[float, np.ndarray]:
-    """Total cost = ergodic metric + control cost + constraint penalties."""
     traj_full = rollout_unicycle(
         x0=x0,
         omega_seq=omega_seq,
@@ -1140,7 +942,6 @@ def objective_of_omega(
     traj_xy = traj_full[:, :2]
     ck_plan = ergodic_cache.trajectory_fourier_coefficients(traj_xy)
 
-    # Blend past history c_bar_k with current plan (Mavrommati 2018 Eq.17)
     H = len(omega_seq)
     if ck_bar_i is not None and steps_in_memory > 0:
         total_duration = steps_in_memory + H
@@ -1148,7 +949,6 @@ def objective_of_omega(
     else:
         full_ck = ck_plan
 
-    # Team ergodic metric via coefficient sharing
     e_cost = ergodic_cache.team_ergodic_metric_from_coefficients(
         local_ck=full_ck,
         phi_map=phi_map,
@@ -1156,7 +956,6 @@ def objective_of_omega(
     )
     u_cost = omega_cost(omega_seq, weight=planner_params.control_effort_weight)
 
-    # Inequality constraint penalties (separation + boundary)
     c_cost = inequality_constraint_penalty(
         traj_xy=traj_xy,
         world_size=phi_map.shape[0],
@@ -1181,7 +980,6 @@ def finite_difference_gradient_omega(
     ck_bar_i: Optional[np.ndarray] = None,
     steps_in_memory: int = 0,
 ) -> np.ndarray:
-    """Central-difference gradient of objective w.r.t. omega sequence."""
     eps = planner_params.fd_eps
     grad = np.zeros_like(omega_seq)
 
@@ -1211,11 +1009,9 @@ def rbf_kernel_and_grad(
     particles_flat: np.ndarray,
     bandwidth: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """RBF kernel with median heuristic bandwidth (Liu & Wang 2016)."""
     diffs = particles_flat[:, None, :] - particles_flat[None, :, :]
     sq = np.sum(diffs * diffs, axis=-1)
 
-    # Median heuristic: h = median(||x_i - x_j||^2) / log(N)
     N = particles_flat.shape[0]
     off_diag = sq[~np.eye(N, dtype=bool)]
     median_sq = float(np.median(off_diag)) if len(off_diag) > 0 else 0.0
@@ -1241,14 +1037,9 @@ def svgd_optimize_omega(
     ck_bar_i: Optional[np.ndarray] = None,
     steps_in_memory: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    SVGD-based trajectory optimisation over omega sequences.
-    Returns (best_omega, all_particles, particle_variance, best_ck).
-    """
     H = planner_params.horizon
     N = planner_params.num_particles
 
-    # Initialise particles from warm-start or random
     if initial_omega is None:
         particles = rng.normal(
             loc=0.0, scale=planner_params.svgd_init_sigma, size=(N, H)
@@ -1263,7 +1054,6 @@ def svgd_optimize_omega(
 
     prior_sigma = max(float(planner_params.omega_prior_sigma), 1e-6)
 
-    # SVGD iterations
     for _ in range(planner_params.svgd_iters):
         K, gradK = rbf_kernel_and_grad(particles, planner_params.bandwidth)
 
@@ -1286,7 +1076,6 @@ def svgd_optimize_omega(
                 + planner_params.prior_weight * prior_score
             )
 
-        # SVGD update: phi(x) = (1/N) sum_j [K(x_j,x)*score(x_j) + grad_K(x_j,x)]
         phi_svgd = np.zeros_like(particles)
         for i in range(N):
             acc = np.zeros(H, dtype=float)
@@ -1297,7 +1086,6 @@ def svgd_optimize_omega(
         particles = particles + planner_params.step_size * phi_svgd
         particles = np.clip(particles, -planner_params.omega_max, planner_params.omega_max)
 
-    # Select best particle
     scores = np.zeros((N,), dtype=float)
     local_cks = np.zeros((N, ergodic_cache.num_basis), dtype=float)
     for i in range(N):
@@ -1322,7 +1110,6 @@ def svgd_optimize_omega(
 
 
 def shift_omega_horizon(omega_seq: np.ndarray, fill_zero: bool = True) -> np.ndarray:
-    """Shift omega sequence left by 1 for warm-starting next step."""
     shifted = np.zeros_like(omega_seq)
     shifted[:-1] = omega_seq[1:]
     shifted[-1] = 0.0 if fill_zero else omega_seq[-1]
@@ -1341,7 +1128,6 @@ def draw_drone_icon(
     color: str = "white",
     zorder: int = 10,
 ):
-    """Draw a quadrotor icon on the given axes."""
     artists = []
 
     body_r = 0.34 * size
@@ -1398,10 +1184,6 @@ def draw_drone_icon(
 # ============================================================
 
 class FinalWildfireMonitoringEnv:
-    """
-    Main environment: manages ground truth fire, belief state, sensor
-    observations, Bayesian updates, and EID computation.
-    """
     def __init__(
         self,
         world_size: int = 100,
@@ -1427,7 +1209,6 @@ class FinalWildfireMonitoringEnv:
         self._cb = []
         self._burn_scatter = None
 
-        # tau_fire / tau_burn read from TransitionParams at reset() time
         self.tau_fire: float = 0.0
         self.tau_burn: float = 0.0
 
@@ -1445,7 +1226,6 @@ class FinalWildfireMonitoringEnv:
         self.planner_params = planner_params
         self.fire_params = fire_params
 
-        # Fire-state classification thresholds sourced from TransitionParams
         self.tau_fire = float(transition_params.tau_fire)
         self.tau_burn = float(transition_params.tau_burn)
 
@@ -1453,7 +1233,6 @@ class FinalWildfireMonitoringEnv:
 
         n = self.world_size
 
-        # Generate random fire ignition hotspots
         hotspots = generate_random_hotspots(
             world_size=n,
             num_hotspots=self.fireAreas_Num,
@@ -1463,7 +1242,6 @@ class FinalWildfireMonitoringEnv:
             rng=self.rng,
         )
 
-        # Initialise FireCommander simulator
         self.wildfire = WildFire(
             terrain_sizes=[n, n],
             hotspot_areas=hotspots,
@@ -1482,7 +1260,6 @@ class FinalWildfireMonitoringEnv:
             avg_wind_direction=float(fire_params.avg_wind_direction),
         )
 
-        # Ground truth fire state
         self.active_fronts = self.wildfire.hotspot_init()
         self.previous_terrain_map = self.active_fronts.copy()
         self.time_vector = np.zeros(self.active_fronts.shape[0], dtype=float)
@@ -1496,7 +1273,6 @@ class FinalWildfireMonitoringEnv:
             tau_burn=self.tau_burn,
         )
 
-        # Belief state (seeded from known initial ignition)
         self.belief_map = initialize_belief_from_initial_fire(
             world_size=n,
             initial_fronts=self.active_fronts,
@@ -1505,9 +1281,6 @@ class FinalWildfireMonitoringEnv:
             seed_floor=transition_params.belief_seed_floor,
         )
 
-        # Belief-side fire state: parallel to ground truth. Divergence arises
-        # from (a) sensor-update corrections and (b) the probability-space
-        # process noise ω_t (Gaussian diffusion on P(FIRE)).
         self.belief_active_fronts = self.active_fronts.copy()
         self.belief_time_vector = np.zeros(self.belief_active_fronts.shape[0], dtype=float)
         self.belief_previous_terrain = self.belief_active_fronts.copy()
@@ -1522,7 +1295,6 @@ class FinalWildfireMonitoringEnv:
         self.pred_belief_active_raster = np.zeros((n, n), dtype=float)
         self.pred_belief_burnt_raster = np.zeros((n, n), dtype=float)
 
-        # UAV initialisation
         if init_states is None:
             if num_uavs is None:
                 num_uavs = 3
@@ -1544,7 +1316,6 @@ class FinalWildfireMonitoringEnv:
         self.trajs = [[self.robot_states[i].copy()] for i in range(self.num_uavs)]
         self.t = 0
 
-        # Initial EID (no prediction available yet)
         self.lambda_map, self.sigma_map, self.mi_map, self.psi_map, self.phi_map = target_distribution(
             belief_map      = self.belief_map,
             sensor_params   = self.sensor_params,
@@ -1564,7 +1335,7 @@ class FinalWildfireMonitoringEnv:
         self.t += 1
         omegas = np.asarray(omegas, dtype=float)
 
-        # ── Belief prediction (FARSITE + noise) ──────────────────────────
+        # ── Belief prediction (deterministic FARSITE, no additive noise) ─
         (belief_pred, pred_active_raster, pred_burnt_raster,
          next_b_fronts, next_b_time, next_b_burnt, next_b_prev_terrain,
          next_b_state_map) = predict_belief_with_tracked_state(
@@ -1584,7 +1355,6 @@ class FinalWildfireMonitoringEnv:
             rng=self.rng,
         )
 
-        # Update belief-side fire state
         self.belief_active_fronts = next_b_fronts
         self.belief_time_vector = next_b_time
         self.belief_burnt_out_points = next_b_burnt
@@ -1671,7 +1441,6 @@ class FinalWildfireMonitoringEnv:
             pred_belief_map = belief_pred,
         )
 
-        # Temporal EMA on EID (see PlannerParams.phi_ema_alpha).
         alpha_ema = float(self.planner_params.phi_ema_alpha)
         if alpha_ema < 1.0 and hasattr(self, '_phi_map_prev') \
                 and self._phi_map_prev is not None:
@@ -1707,7 +1476,6 @@ class FinalWildfireMonitoringEnv:
         inference_vars: Optional[np.ndarray] = None,
         pause: float = 0.05,
     ):
-        """Live matplotlib rendering: EID | Belief State | Ground Truth."""
         phi_show = self.phi_map
         belief_state_show = belief_to_display_state(self.belief_map)
         gt_state_show = self.true_state_map
@@ -1779,7 +1547,6 @@ class FinalWildfireMonitoringEnv:
 
         self._im0.set_data(phi_show)
 
-        # Rescale colorbar to current data range each frame
         phi_min = float(np.min(phi_show))
         phi_max = float(np.max(phi_show))
         if phi_max - phi_min < 1e-15:
@@ -1867,9 +1634,6 @@ class FinalWildfireMonitoringEnv:
 # ============================================================
 
 if __name__ == "__main__":
-    # ================================================================
-    # Experiment configuration
-    # ================================================================
 
     transition_params = TransitionParams(
         belief_seed_cap=0.98,
@@ -1877,7 +1641,6 @@ if __name__ == "__main__":
         tau_fire=0.10,
         tau_burn=0.08,
         eps=1e-6,
-        belief_diffusion_sigma=0.8,
         info_decay_rate=0.003,
     )
 
@@ -1918,12 +1681,6 @@ if __name__ == "__main__":
         memory_horizon_multiplier=2.0,
     )
 
-    # Belief-convergence constraint (derived from first principles):
-    #   C_max · T_revisit < fov_radius
-    #   C_max = 0.5·(R_max − R_max/HB)  [FARSITE LB/HB formula]
-    #   T_revisit ≈ world_size² / (n_uavs · (2·fov_radius+1)²) ≈ 11.5 steps
-    # With max_fuel_coeff=1.0 and avg_wind_speed=2.0 → C_max ≈ 0.43 cells/step,
-    # so fire moves ≈ 5 cells per revisit cycle  <  fov_radius=8  ✓
     fire_params = FireParams(
         num_ign_points=300,
         radiation_radius=50.0,
@@ -1989,9 +1746,6 @@ if __name__ == "__main__":
         rounds=planner_params.consensus_rounds,
     )
 
-    # Ergodic memory window M_erg: accumulates past trajectory coefficients
-    # (Mavrommati 2018 Eq.17).  Bounded to avoid unbounded accumulation while
-    # remaining at least as long as the current plan.
     M_ERG = int(round(planner_params.memory_horizon_multiplier * planner_params.horizon))
     ck_bar = np.zeros((num_uavs, ergodic_cache.num_basis), dtype=float)
     steps_in_memory = 0
@@ -2004,7 +1758,6 @@ if __name__ == "__main__":
         inference_vars = np.zeros((num_uavs,), dtype=float)
         local_ck_updates = np.zeros_like(local_ck_memory)
 
-        # Generate reference trajectories from warm-starts for separation constraints
         reference_preview_trajs: List[np.ndarray] = []
         for i in range(num_uavs):
             ref_traj_i = rollout_unicycle(
@@ -2016,7 +1769,6 @@ if __name__ == "__main__":
             )[:, :2]
             reference_preview_trajs.append(ref_traj_i)
 
-        # Per-agent SVGD optimisation
         for i in range(num_uavs):
             neighbor_cks = [consensus_ck_memory[j].copy() for j in range(num_uavs) if j != i]
             neighbor_reference_trajs = [reference_preview_trajs[j] for j in range(num_uavs) if j != i]
@@ -2047,23 +1799,15 @@ if __name__ == "__main__":
             )[:, :2]
             preview_trajs[i] = preview_traj_i
 
-        # Consensus update
         local_ck_memory = local_ck_updates.copy()
         consensus_ck_memory = fully_connected_ck_consensus(
             local_ck_memory,
             rounds=planner_params.consensus_rounds,
         )
 
-        # Execute first control action
         omegas0 = best_omega_seqs[:, 0]
         obs = env.step(omegas0, planner_params)
 
-        # Update ergodic memory c_bar_k (Mavrommati 2018 Eq.17).
-        # Discrete form with Δt = 1:
-        #   c̄_new = [(m + H - 1) · c̄_old + F_k(x_i)] / (m + H)
-        # where m = number of executed steps BEFORE this update (steps_in_memory),
-        # so old_total = m + H - 1 and new_total = m + H.  At m = 0 this
-        # reduces to c̄_new = [(H-1) · c̄_old + F_k(x_0)] / H.
         H = planner_params.horizon
         for i in range(num_uavs):
             executed_pos = obs["robot_states"][i, :2].reshape(1, 2)
@@ -2081,11 +1825,9 @@ if __name__ == "__main__":
             pause=0.05,
         )
 
-        # Warm-start next step
         for i in range(num_uavs):
             warm_start_omegas[i] = shift_omega_horizon(best_omega_seqs[i], fill_zero=True)
 
-        # Logging
         p_fire = env.belief_map[:, :, FIRE]
         p_burned = env.belief_map[:, :, BURNED]
         print(
