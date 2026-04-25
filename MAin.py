@@ -15,44 +15,24 @@ from matplotlib.patches import Rectangle, Circle
 
 from WildFire_Model import WildFire
 
-
-# ============================================================
-# Experiment parameters
-# ============================================================
-
 num_uavs = 3
 
-
-# ============================================================
-# Numerical precision constant
-# ============================================================
 NUM_EPS: float = 1e-12
-
-
-# ============================================================
-# State encoding (HMM hidden states)
-# ============================================================
 
 HEALTHY = 0
 FIRE = 1
 BURNED = 2
 
 WILDFIRE_CMAP = ListedColormap([
-    "#2e8b57",  # healthy  (green)
-    "#ff8c00",  # fire     (orange)
-    "#000000",  # burned   (black)
+    "#2e8b57",
+    "#ff8c00",
+    "#000000",
 ])
 
 UAV_COLORS = ["white", "cyan", "magenta", "yellow", "lime", "orange"]
 
-
-# ============================================================
-# Parameter dataclasses
-# ============================================================
-
 @dataclass
 class TransitionParams:
-    """Parameters for HMM belief transition."""
 
     belief_seed_cap: float = 0.98
     belief_seed_floor: float = 0.015
@@ -61,10 +41,6 @@ class TransitionParams:
     tau_burn: float = 0.05
 
     eps: float = 1e-6
-
-    # Information decay: unobserved cells mix toward max entropy [1/3,1/3,1/3]
-    info_decay_rate: float = 0.001
-
 
 @dataclass
 class SensorParams:
@@ -79,10 +55,8 @@ class SensorParams:
         if not 0.0 < self.pm <= 1.0:
             raise ValueError(f"pm must be in (0, 1], got {self.pm}")
 
-
 @dataclass
 class PlannerParams:
-    """SVGD-based receding-horizon ergodic planner parameters."""
 
     horizon: int = 15
     num_particles: int = 15
@@ -115,19 +89,12 @@ class PlannerParams:
 
     consensus_rounds: int = 2
 
-    smooth_kernel_size: float = 5
-    smooth_sigma: float = 1.0
-
-    phi_ema_alpha: float = 0.15
-
     init_boundary_margin: float = 5.0
 
     memory_horizon_multiplier: float = 2.0
 
-
 @dataclass
 class FireParams:
-    """Fire physics / simulator configuration."""
 
     num_ign_points: int = 600
     radiation_radius: float = 80.0
@@ -145,7 +112,6 @@ class FireParams:
     avg_wind_direction: float = np.pi / 10
 
     base_prior: Tuple[float, float, float] = (0.95, 0.03, 0.02)
-
 
 def generate_uav_initial_states(
     num_uavs: int,
@@ -179,26 +145,18 @@ def generate_uav_initial_states(
 
     return np.asarray(states, dtype=float)
 
-
-# ============================================================
-# General helpers
-# ============================================================
-
 def clip_xy(x: float, y: float, world_size: int) -> Tuple[float, float]:
     x = float(np.clip(x, 0.0, world_size - 1.0))
     y = float(np.clip(y, 0.0, world_size - 1.0))
     return x, y
 
-
 def wrap_angle(theta: float) -> float:
     return (theta + np.pi) % (2.0 * np.pi) - np.pi
-
 
 def normalize_belief(belief: np.ndarray, eps: float = NUM_EPS) -> np.ndarray:
     denom = np.sum(belief, axis=-1, keepdims=True)
     denom = np.maximum(denom, eps)
     return belief / denom
-
 
 def observation_confusion_matrix(sensor_params: SensorParams) -> np.ndarray:
     n = sensor_params.n_states
@@ -208,10 +166,8 @@ def observation_confusion_matrix(sensor_params: SensorParams) -> np.ndarray:
     np.fill_diagonal(M, pm)
     return M
 
-
 def belief_to_display_state(belief_map: np.ndarray) -> np.ndarray:
     return np.argmax(belief_map, axis=-1).astype(np.int32)
-
 
 def generate_random_hotspots(
     world_size: int,
@@ -250,11 +206,6 @@ def generate_random_hotspots(
 
     return hotspots
 
-
-# ============================================================
-# Rasterization and true state map
-# ============================================================
-
 def rasterize_intensity(points_xyz: np.ndarray, n: int) -> np.ndarray:
     I = np.zeros((n, n), dtype=float)
     if points_xyz is None or len(points_xyz) == 0:
@@ -268,35 +219,49 @@ def rasterize_intensity(points_xyz: np.ndarray, n: int) -> np.ndarray:
     np.maximum.at(I, (xs, ys), vals)
     return I
 
-
 def intensity_to_state_map(
     intensity_map: np.ndarray,
     prev_state_map: Optional[np.ndarray],
     tau_fire: float,
     tau_burn: float,
 ) -> np.ndarray:
-    state_map = np.full(intensity_map.shape, HEALTHY, dtype=np.int32)
+    """
+    Explicit finite-state-machine transitions for each cell:
+
+        HEALTHY  --[intensity > tau_fire]--> FIRE
+        FIRE     --[intensity < tau_burn]--> BURNED   (hysteresis: stays FIRE in gap)
+        BURNED   --> BURNED                           (absorbing: no fuel remaining)
+
+    Starting from prev_state_map (not a blank canvas) gives hysteresis:
+    a FIRE cell whose intensity dips into [tau_burn, tau_fire] stays FIRE
+    instead of silently reverting to HEALTHY.
+    """
+    assert tau_burn < tau_fire, (
+        f"tau_burn ({tau_burn}) must be < tau_fire ({tau_fire}) for hysteresis to be valid"
+    )
 
     if prev_state_map is None:
         prev_state_map = np.full(intensity_map.shape, HEALTHY, dtype=np.int32)
 
-    burning_mask = intensity_map > tau_fire
-    burned_mask = ((prev_state_map == FIRE) & (intensity_map < tau_burn)) | (prev_state_map == BURNED)
+    # Inherit previous state — hysteresis by default.
+    state_map = prev_state_map.copy()
 
-    state_map[burned_mask] = BURNED
-    state_map[burning_mask] = FIRE
+    # HEALTHY → FIRE: fresh ignition only when intensity crosses the upper threshold.
+    ignition = (prev_state_map == HEALTHY) & (intensity_map > tau_fire)
+    state_map[ignition] = FIRE
+
+    # FIRE → BURNED: fire dies out only when intensity drops below the lower threshold.
+    extinguish = (prev_state_map == FIRE) & (intensity_map < tau_burn)
+    state_map[extinguish] = BURNED
+
+    # BURNED → BURNED: absorbing state, already preserved by the copy above.
+
     return state_map
-
-
-# ============================================================
-# FireCommander2020 simulator wrapper
-# ============================================================
 
 def _safe_pruned_list(pruned_points: Optional[np.ndarray]) -> List[List[int]]:
     if pruned_points is None or len(pruned_points) == 0:
         return []
     return [[int(round(float(p[0]))), int(round(float(p[1])))] for p in pruned_points]
-
 
 def simulate_fire_one_step(
     wildfire_model,
@@ -325,6 +290,14 @@ def simulate_fire_one_step(
         pruned_List=pruned_list,
     )
 
+    # Enforce grid boundary: FARSITE propagation is continuous and can push
+    # fronts to exactly world_size (e.g. 100.0 on a 100-cell grid).  Clamp
+    # x/y to [0, world_size-1] so fire_decay's spread_rate lookup never
+    # receives an out-of-bounds index.  Uses the existing clip_xy contract.
+    if len(propagated_fronts) > 0:
+        propagated_fronts[:, 0] = np.clip(propagated_fronts[:, 0], 0.0, world_size - 1.0)
+        propagated_fronts[:, 1] = np.clip(propagated_fronts[:, 1], 0.0, world_size - 1.0)
+
     next_active_fronts, next_time_vector, burnt_out_fires = wildfire_model.fire_decay(
         terrain_map=propagated_fronts.copy(),
         time_vector=time_vector.copy(),
@@ -334,18 +307,12 @@ def simulate_fire_one_step(
 
     return next_active_fronts, next_time_vector, burnt_out_fires
 
-
-# ============================================================
-# Belief initialization and belief-front extraction
-# ============================================================
-
 def initialize_belief(world_size: int, prior=(0.95, 0.03, 0.02)) -> np.ndarray:
     belief = np.zeros((world_size, world_size, 3), dtype=float)
     belief[:, :, HEALTHY] = prior[0]
     belief[:, :, FIRE] = prior[1]
     belief[:, :, BURNED] = prior[2]
     return normalize_belief(belief)
-
 
 def initialize_belief_from_initial_fire(
     world_size: int,
@@ -378,11 +345,6 @@ def initialize_belief_from_initial_fire(
 
     return normalize_belief(belief)
 
-
-# ============================================================
-# Belief transition (deterministic FARSITE only, no additive noise)
-# ============================================================
-
 def predict_belief_with_tracked_state(
     belief_map: np.ndarray,
     wildfire_model,
@@ -400,28 +362,10 @@ def predict_belief_with_tracked_state(
     rng: Optional[np.random.Generator] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Predict next belief using the same deterministic FARSITE model as ground truth.
 
-    No additional process noise is applied — the internal stochasticity of
-    FARSITE (random wind draws, Gaussian intensity deviations) already provides
-    the natural process noise, exactly matching the ground-truth simulator.
-
-    Pipeline:
-      1-3. simulate_fire_one_step() — deterministic FARSITE propagation
-      4.   Rasterize predicted fronts
-      5.   Classify into state map
-      6.   Build per-cell transition tensor T
-      7.   Chapman-Kolmogorov: b'(s') = sum_s b(s) * T(s'|s)
-
-    Returns: (predicted_belief, pred_active_raster, pred_burnt_raster,
-              next_fronts, next_time_vec, next_burnt_out, next_prev_terrain,
-              next_state_map)
-    """
     eps = transition_params.eps
     nx = ny = world_size
 
-    # Empty fronts => identity transition
     if belief_active_fronts is None or len(belief_active_fronts) == 0:
         T = np.zeros((nx, ny, 3, 3), dtype=float)
         T[:, :, HEALTHY, HEALTHY] = 1.0
@@ -438,7 +382,6 @@ def predict_belief_with_tracked_state(
         return (predicted, z, z,
                 empty3, empty1, empty3, empty3, prev_sm)
 
-    # Steps 1-3: Deterministic FARSITE propagation
     next_belief_fronts, next_belief_time_vector, next_belief_burnt_out = \
         simulate_fire_one_step(
             wildfire_model=wildfire_model,
@@ -451,11 +394,9 @@ def predict_belief_with_tracked_state(
             pruned_points=belief_burnt_out_points,
         )
 
-    # Step 4: Rasterize predicted fronts
     pred_active_raster_raw = rasterize_intensity(next_belief_fronts, world_size)
     pred_burnt_raster_raw  = rasterize_intensity(next_belief_burnt_out, world_size)
 
-    # Step 5: Classify predicted state map (same thresholds as ground truth)
     next_belief_state_map = intensity_to_state_map(
         intensity_map=pred_active_raster_raw,
         prev_state_map=belief_prev_state_map,
@@ -463,31 +404,37 @@ def predict_belief_with_tracked_state(
         tau_burn=tau_burn,
     )
 
-    # Step 6: Build transition tensor T[i,j,s_curr,s_next]
-    current_state_map = np.argmax(belief_map, axis=-1).astype(np.int32)
+    # -----------------------------------------------------------------------
+    # Hard 0/1 transition matrix built directly from next_belief_state_map.
+    # simulate_fire_one_step → fire_propagation already incorporates
+    # stochasticity internally (wind row sampling, intensity deviation via
+    # np.random).  The four input-noise channels (wind speed, wind direction,
+    # spread rate, front position jitter) propagate additional uncertainty
+    # through the FARSITE physics.  pred_active_raster_raw is therefore
+    # already a stochastic sample from the true fire process — no further
+    # noise wrapping is needed or appropriate.
+    #
+    # FSM constraints enforced explicitly:
+    #   HEALTHY → HEALTHY | FIRE   (can ignite, never skip to BURNED)
+    #   FIRE    → FIRE    | BURNED (irreversible, never recover to HEALTHY)
+    #   BURNED  → BURNED            (absorbing — no fuel)
+    # -----------------------------------------------------------------------
+    next_fire   = (next_belief_state_map == FIRE)
+    next_burned = (next_belief_state_map == BURNED)
 
     T = np.zeros((nx, ny, 3, 3), dtype=float)
-    for s_curr in range(3):
-        mask_curr = (current_state_map == s_curr)
-        for s_next in range(3):
-            T[:, :, s_curr, s_next] = (
-                mask_curr & (next_belief_state_map == s_next)
-            ).astype(float)
 
-    # Physical constraint: HEALTHY cannot jump directly to BURNED
-    T[:, :, HEALTHY, BURNED] = 0.0
-    h_row_sum = T[:, :, HEALTHY, :].sum(axis=-1, keepdims=True)
-    h_row_sum = np.maximum(h_row_sum, eps)
-    T[:, :, HEALTHY, :] /= h_row_sum
+    # HEALTHY row
+    T[:, :, HEALTHY, FIRE]    = next_fire.astype(float)
+    T[:, :, HEALTHY, HEALTHY] = (~next_fire).astype(float)
 
-    # Identity fallback for rows that don't sum to 1
-    for s_curr in range(3):
-        row_sum = T[:, :, s_curr, :].sum(axis=-1)
-        zero_rows = row_sum < eps
-        if np.any(zero_rows):
-            T[zero_rows, s_curr, s_curr] = 1.0
+    # FIRE row
+    T[:, :, FIRE, BURNED] = next_burned.astype(float)
+    T[:, :, FIRE, FIRE]   = (~next_burned).astype(float)
 
-    # Step 7: Chapman-Kolmogorov predict: b'(s') = sum_s b(s) * T(s'|s)
+    # BURNED row — absorbing
+    T[:, :, BURNED, BURNED] = 1.0
+
     pH = belief_map[:, :, HEALTHY]
     pF = belief_map[:, :, FIRE]
     pB = belief_map[:, :, BURNED]
@@ -511,7 +458,6 @@ def predict_belief_with_tracked_state(
     predicted = np.stack([predH, predF, predB], axis=-1)
     predicted = normalize_belief(predicted)
 
-    # Normalised intensity rasters for logging
     active_max = float(np.max(pred_active_raster_raw))
     burnt_max  = float(np.max(pred_burnt_raster_raw))
     pred_active_norm = (pred_active_raster_raw / max(active_max, eps)) if active_max > 0.0 \
@@ -529,18 +475,12 @@ def predict_belief_with_tracked_state(
             next_belief_burnt_out, next_belief_prev_terrain,
             next_belief_state_map)
 
-
-# ============================================================
-# Sensor model and Bayesian update
-# ============================================================
-
 def containing_cell_from_position(robot_xy: Sequence[float], world_size: int) -> Tuple[int, int]:
     x = float(robot_xy[0])
     y = float(robot_xy[1])
     i = int(np.floor(np.clip(x, 0.0, world_size - 1.0)))
     j = int(np.floor(np.clip(y, 0.0, world_size - 1.0)))
     return i, j
-
 
 def chebyshev_fov_mask(world_size: int, robot_xy: Sequence[float], fov_radius: int) -> np.ndarray:
     i, j = containing_cell_from_position(robot_xy, world_size)
@@ -554,7 +494,6 @@ def chebyshev_fov_mask(world_size: int, robot_xy: Sequence[float], fov_radius: i
 
     mask[i_min:i_max + 1, j_min:j_max + 1] = True
     return mask
-
 
 def sample_square_fov_observation(
     true_state_map: np.ndarray,
@@ -577,16 +516,12 @@ def sample_square_fov_observation(
 
     return mask, obs_map
 
-
 def multi_uav_bayesian_fusion(
     predicted_belief: np.ndarray,
     observations: List[Tuple[np.ndarray, np.ndarray]],
     sensor_params: SensorParams,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Bayesian belief update for multiple UAVs using LOG-ODDS representation.
-    (Thrun, Burgard, Fox, "Probabilistic Robotics", MIT Press 2005, Ch. 9)
-    """
+
     eps = NUM_EPS
 
     LOG_ODDS_CLAMP = float(sensor_params.log_odds_clamp)
@@ -638,19 +573,9 @@ def multi_uav_bayesian_fusion(
     updated = normalize_belief(updated)
     return updated, observed_any, obs_count
 
-
-# ============================================================
-# Information maps
-# ============================================================
-
-def burning_belief_map(belief_map: np.ndarray) -> np.ndarray:
-    return belief_map[:, :, FIRE].copy()
-
-
 def entropy_map(belief_map: np.ndarray, eps: float = NUM_EPS) -> np.ndarray:
     p = np.clip(belief_map, eps, 1.0)
     return -np.sum(p * np.log(p), axis=-1)
-
 
 def mutual_information_map(
     belief_map: np.ndarray,
@@ -670,23 +595,6 @@ def mutual_information_map(
 
     return np.maximum(mi, 0.0)
 
-
-def gaussian_kernel(size: int = 5, sigma: float = 1.0) -> np.ndarray:
-    if size % 2 == 0:
-        size += 1
-    ax = np.arange(-(size // 2), size // 2 + 1, dtype=float)
-    xx, yy = np.meshgrid(ax, ax, indexing="ij")
-    K = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
-    K /= np.sum(K)
-    return K
-
-
-def smooth_map(map2d: np.ndarray, size: int = 5, sigma: float = 1.0) -> np.ndarray:
-    from scipy.ndimage import convolve
-    K = gaussian_kernel(size=size, sigma=sigma)
-    return convolve(map2d.astype(float), K, mode="nearest")
-
-
 def _phi_pure_single_step(
     belief: np.ndarray,
     sensor_params: SensorParams,
@@ -694,7 +602,6 @@ def _phi_pure_single_step(
     mi  = mutual_information_map(belief, sensor_params)
     lam = belief[:, :, FIRE]
     return mi * lam
-
 
 def target_distribution(
     belief_map: np.ndarray,
@@ -723,24 +630,13 @@ def target_distribution(
 
     psi_map = phi_acc / float(num_steps)
 
-    phi_smooth = smooth_map(
-        psi_map,
-        size=planner_params.smooth_kernel_size,
-        sigma=planner_params.smooth_sigma,
-    )
-
-    s_total = np.sum(phi_smooth)
+    s_total = np.sum(psi_map)
     if s_total <= 0.0:
-        phi = np.ones_like(phi_smooth) / phi_smooth.size
+        phi = np.ones_like(psi_map) / psi_map.size
     else:
-        phi = phi_smooth / s_total
+        phi = psi_map / s_total
 
     return lambda_map, sigma_map, mi_map, psi_map, phi
-
-
-# ============================================================
-# Ergodic metric (Fourier-based)
-# ============================================================
 
 class ErgodicCache:
     def __init__(self, world_size_x: int, world_size_y: int, order_x: int, order_y: int):
@@ -840,11 +736,6 @@ class ErgodicCache:
             neighbor_cks=neighbor_cks,
         )
 
-
-# ============================================================
-# Unicycle dynamics + SVGD trajectory optimisation
-# ============================================================
-
 def rollout_unicycle(
     x0: Sequence[float],
     omega_seq: np.ndarray,
@@ -866,10 +757,8 @@ def rollout_unicycle(
 
     return np.asarray(traj, dtype=float)
 
-
 def omega_cost(omega_seq: np.ndarray, weight: float) -> float:
     return float(weight * np.sum(omega_seq ** 2))
-
 
 def inequality_constraint_penalty(
     traj_xy: np.ndarray,
@@ -901,7 +790,6 @@ def inequality_constraint_penalty(
 
     return total
 
-
 def fully_connected_ck_consensus(
     local_ck_matrix: np.ndarray,
     rounds: int = 1,
@@ -918,7 +806,6 @@ def fully_connected_ck_consensus(
     for _ in range(max(int(rounds), 1)):
         ck = P @ ck
     return ck
-
 
 def objective_of_omega(
     x0: Sequence[float],
@@ -968,7 +855,6 @@ def objective_of_omega(
         return total_cost, full_ck
     return total_cost
 
-
 def finite_difference_gradient_omega(
     x0: Sequence[float],
     omega_seq: np.ndarray,
@@ -1004,7 +890,6 @@ def finite_difference_gradient_omega(
 
     return grad
 
-
 def rbf_kernel_and_grad(
     particles_flat: np.ndarray,
     bandwidth: float,
@@ -1014,16 +899,15 @@ def rbf_kernel_and_grad(
 
     N = particles_flat.shape[0]
     off_diag = sq[~np.eye(N, dtype=bool)]
-    median_sq = float(np.median(off_diag)) if len(off_diag) > 0 else 0.0
-    if median_sq > 1e-10 and N > 1:
-        h = median_sq / max(np.log(float(N)), 1e-8)
+    if len(off_diag) > 0 and N > 1:
+        med = float(np.median(np.sqrt(np.maximum(off_diag, 0.0))))
+        h = (med ** 2) / max(np.log(float(N)), 1e-8) if med > 1e-10 else max(bandwidth, 1e-6)
     else:
         h = max(bandwidth, 1e-6)
 
     K = np.exp(-sq / h)
     gradK = (-2.0 / h) * K[:, :, None] * diffs
     return K, gradK
-
 
 def svgd_optimize_omega(
     x0: Sequence[float],
@@ -1108,17 +992,11 @@ def svgd_optimize_omega(
     particle_variance = np.var(particles, axis=0)
     return particles[best_idx].copy(), particles.copy(), particle_variance.copy(), local_cks[best_idx].copy()
 
-
 def shift_omega_horizon(omega_seq: np.ndarray, fill_zero: bool = True) -> np.ndarray:
     shifted = np.zeros_like(omega_seq)
     shifted[:-1] = omega_seq[1:]
     shifted[-1] = 0.0 if fill_zero else omega_seq[-1]
     return shifted
-
-
-# ============================================================
-# Visualization
-# ============================================================
 
 def draw_drone_icon(
     ax,
@@ -1177,11 +1055,6 @@ def draw_drone_icon(
         artists.append(prop)
 
     return artists
-
-
-# ============================================================
-# Environment
-# ============================================================
 
 class FinalWildfireMonitoringEnv:
     def __init__(
@@ -1322,7 +1195,6 @@ class FinalWildfireMonitoringEnv:
             planner_params  = self.planner_params,
             pred_belief_map = None,
         )
-        self._phi_map_prev = self.phi_map.copy()
 
         self.last_obs_count = np.zeros((n, n), dtype=np.int32)
         self.cumulative_observed_mask = np.zeros((n, n), dtype=bool)
@@ -1335,7 +1207,6 @@ class FinalWildfireMonitoringEnv:
         self.t += 1
         omegas = np.asarray(omegas, dtype=float)
 
-        # ── Belief prediction (deterministic FARSITE, no additive noise) ─
         (belief_pred, pred_active_raster, pred_burnt_raster,
          next_b_fronts, next_b_time, next_b_burnt, next_b_prev_terrain,
          next_b_state_map) = predict_belief_with_tracked_state(
@@ -1364,7 +1235,6 @@ class FinalWildfireMonitoringEnv:
         self.pred_belief_active_raster = pred_active_raster
         self.pred_belief_burnt_raster = pred_burnt_raster
 
-        # ── Ground truth fire propagation ────────────────────────────────
         next_active_fronts, next_time_vector, next_burnt_out = simulate_fire_one_step(
             wildfire_model=self.wildfire,
             world_size=self.world_size,
@@ -1391,7 +1261,6 @@ class FinalWildfireMonitoringEnv:
             tau_burn=self.tau_burn,
         )
 
-        # ── Move UAVs ────────────────────────────────────────────────────
         for i in range(self.num_uavs):
             x, y, theta = self.robot_states[i]
             x = x + self.planner_params.v0 * np.cos(theta) * self.planner_params.dt
@@ -1401,7 +1270,6 @@ class FinalWildfireMonitoringEnv:
             self.robot_states[i] = np.array([x, y, theta], dtype=float)
             self.trajs[i].append(self.robot_states[i].copy())
 
-        # ── Sensor observations + Bayesian fusion ────────────────────────
         all_observations: List[Tuple[np.ndarray, np.ndarray]] = []
         for i in range(self.num_uavs):
             observed_mask_i, observation_map_i = sample_square_fov_observation(
@@ -1418,22 +1286,9 @@ class FinalWildfireMonitoringEnv:
             sensor_params=self.sensor_params,
         )
 
-        # ── Information decay for unobserved cells ───────────────────────
-        lam = self.transition_params.info_decay_rate
-        if lam > 0.0:
-            unobserved = ~team_observed_mask
-            if np.any(unobserved):
-                max_ent = np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=float)
-                self.belief_map[unobserved] = (
-                    (1.0 - lam) * self.belief_map[unobserved]
-                    + lam * max_ent[None, :]
-                )
-                self.belief_map = normalize_belief(self.belief_map)
-
         self.last_obs_count = obs_count
         self.cumulative_observed_mask |= team_observed_mask
 
-        # ── Compute EID ──────────────────────────────────────────────────
         self.lambda_map, self.sigma_map, self.mi_map, self.psi_map, phi_raw = target_distribution(
             belief_map      = self.belief_map,
             sensor_params   = self.sensor_params,
@@ -1441,18 +1296,7 @@ class FinalWildfireMonitoringEnv:
             pred_belief_map = belief_pred,
         )
 
-        alpha_ema = float(self.planner_params.phi_ema_alpha)
-        if alpha_ema < 1.0 and hasattr(self, '_phi_map_prev') \
-                and self._phi_map_prev is not None:
-            self.phi_map = alpha_ema * phi_raw + (1.0 - alpha_ema) * self._phi_map_prev
-            s = np.sum(self.phi_map)
-            if s > 0.0:
-                self.phi_map = self.phi_map / s
-            else:
-                self.phi_map = np.ones_like(self.phi_map) / self.phi_map.size
-        else:
-            self.phi_map = phi_raw
-        self._phi_map_prev = self.phi_map.copy()
+        self.phi_map = phi_raw
 
         return self._obs()
 
@@ -1628,11 +1472,6 @@ class FinalWildfireMonitoringEnv:
         self._fig.canvas.draw_idle()
         plt.pause(pause)
 
-
-# ============================================================
-# Main loop
-# ============================================================
-
 if __name__ == "__main__":
 
     transition_params = TransitionParams(
@@ -1641,7 +1480,6 @@ if __name__ == "__main__":
         tau_fire=0.10,
         tau_burn=0.08,
         eps=1e-6,
-        info_decay_rate=0.003,
     )
 
     sensor_params = SensorParams(
@@ -1674,9 +1512,6 @@ if __name__ == "__main__":
         boundary_distance=5.0,
         boundary_weight=0.10,
         consensus_rounds=2,
-        smooth_kernel_size=5,
-        smooth_sigma=1.0,
-        phi_ema_alpha=0.15,
         init_boundary_margin=5.0,
         memory_horizon_multiplier=2.0,
     )
@@ -1754,7 +1589,7 @@ if __name__ == "__main__":
 
     for step in range(num_simulation_steps):
         best_omega_seqs = np.zeros((num_uavs, planner_params.horizon), dtype=float)
-        preview_trajs: List[np.ndarray] = [None] * num_uavs  # type: ignore
+        preview_trajs: List[np.ndarray] = [None] * num_uavs
         inference_vars = np.zeros((num_uavs,), dtype=float)
         local_ck_updates = np.zeros_like(local_ck_memory)
 
@@ -1788,8 +1623,11 @@ if __name__ == "__main__":
 
             best_omega_seqs[i] = best_omega_seq_i
             local_ck_updates[i] = best_ck_i
-            inference_vars[i] = float(np.mean(particle_var_i))
-
+            inference_vars[i] = ergodic_cache.team_ergodic_metric_from_coefficients(
+                local_ck=best_ck_i,
+                phi_map=obs["phi_map"],
+                neighbor_cks=neighbor_cks,
+            )
             preview_traj_i = rollout_unicycle(
                 x0=obs["robot_states"][i],
                 omega_seq=best_omega_seq_i,
@@ -1808,14 +1646,18 @@ if __name__ == "__main__":
         omegas0 = best_omega_seqs[:, 0]
         obs = env.step(omegas0, planner_params)
 
-        H = planner_params.horizon
+        # ck_bar[i] is the per-step mean of Fourier basis values over all
+        # executed positions: mean_{t=1..n}[ F_k(x_t, y_t) ].
+        # objective_of_omega weights it by steps_in_memory, so it must
+        # represent exactly 1 sample per executed step — NOT H samples.
+        # Bug was: old_total = steps_in_memory + H - 1 (wrong H offset),
+        # which diluted each new sample by ~H, making memory nearly invisible.
         for i in range(num_uavs):
             executed_pos = obs["robot_states"][i, :2].reshape(1, 2)
             ck_executed = ergodic_cache.trajectory_fourier_coefficients(executed_pos)
-            old_total = steps_in_memory + H - 1
-            new_total = steps_in_memory + H
-            if new_total > 0:
-                ck_bar[i] = (old_total * ck_bar[i] + ck_executed) / new_total
+            old_n = steps_in_memory          # executed steps so far
+            new_n = steps_in_memory + 1      # after adding this step
+            ck_bar[i] = (old_n * ck_bar[i] + ck_executed) / new_n
 
         steps_in_memory = min(steps_in_memory + 1, M_ERG)
 
@@ -1827,17 +1669,6 @@ if __name__ == "__main__":
 
         for i in range(num_uavs):
             warm_start_omegas[i] = shift_omega_horizon(best_omega_seqs[i], fill_zero=True)
-
-        p_fire = env.belief_map[:, :, FIRE]
-        p_burned = env.belief_map[:, :, BURNED]
-        print(
-            f"[step={step:03d}] "
-            f"entropy={np.mean(env.sigma_map):.4f} | "
-            f"belief_fire_max={np.max(p_fire):.4f} | "
-            f"belief_fire_mean={np.mean(p_fire):.4f} | "
-            f"belief_burned_max={np.max(p_burned):.4f} | "
-            f"pred_active_max={np.max(env.pred_belief_active_raster):.4f}"
-        )
 
         if len(env.active_fronts) == 0 and np.sum(env.true_intensity_map) <= 0.0:
             print("Wildfire extinguished / decayed out. Stopping.")
