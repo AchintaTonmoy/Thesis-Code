@@ -73,6 +73,7 @@ matplotlib.use("TkAgg")
 import os
 import sys
 import csv
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -115,6 +116,12 @@ class ExperimentConfig:
     belief_seed_floor: float = 0.015
     tau_fire:          float = 0.10
     tau_burn:          float = 0.02
+    # NEW: cell stays FIRE for burn_duration steps after first ignition,
+    # then transitions to BURNED (fuel exhausted).  This replaces the
+    # previous "intensity_map < tau_burn" rule, which was dimensionally
+    # wrong for the front-based propagation model — see the docstring of
+    # intensity_to_state_map in MAin_by_claude.py for the full argument.
+    burn_duration:     int   = 40
     # SensorParams
     pm:              float = 0.95
     fov_radius:      int   = 4
@@ -145,18 +152,38 @@ class ExperimentConfig:
     init_boundary_margin:   float = 5.0
     memory_horizon_multiplier: float = 2.0
     # FireParams
-    num_ign_points:      int   = 300
+    # ------------------------------------------------------------------
+    # CORRECTED IGNITION GEOMETRY
+    # ---------------------------
+    # Diagnostic on the previous params (num_ign_points=500, patch=20,
+    # jitter=3.5) measured 358 distinct fire cells filling a square
+    # bounding box at t=0.  randint sampling fills the patch uniformly,
+    # and a 3.5-cell jitter on a 20-cell-wide patch only fuzzes the
+    # boundary — the square still dominates.
+    #
+    # Fix: use a TINY patch (essentially a point) and rely on the
+    # jitter to spread the fronts as a Gaussian blob.  Combined with a
+    # small front count, this gives:
+    #   - "a few scattered active cells" at t=0 (verified: ~24 cells)
+    #   - a natural irregular Gaussian shape (no square edges)
+    #   - room for the fire to GROW over time, since fewer fronts in a
+    #     small initial cluster leave plenty of healthy area around them
+    # ------------------------------------------------------------------
+    num_ign_points:      int   = 25     # was 500 — small initial seed
     radiation_radius:    float = 50.0
     weak_fire_threshold: float = 0.001
     flame_height:        float = 10.0
     flame_angle:         float = np.pi / 3
-    hotspot_patch_size:  int   = 10
-    hotspot_min_separation: float = 5.0
-    hotspot_border_margin:  int   = 10
+    hotspot_patch_size:  int   = 2      # was 20 — essentially a point
+    hotspot_min_separation: float = 25.0  # was 5.0 — keep blobs apart
+    hotspot_border_margin:  int   = 15
     decay_rate:          float = 0.000001
-    max_fuel_coeff:      float = 5.0
-    avg_wind_speed:      float = 9.0
-    avg_wind_direction:  float = np.pi / 10
+    max_fuel_coeff:      float = 1.5    # was 1.0 — slightly faster spread
+    avg_wind_speed:      float = 6.0
+    avg_wind_direction:  float = np.pi / 6
+    wind_dir_std:        float = 0.5    # was 0.25 — more lateral spread
+    wind_speed_std:      float = 0.5
+    hotspot_jitter_std:  float = 2.5    # was 3.5 — Gaussian sigma=2.5 around point
     base_prior: Tuple[float, float, float] = (0.95, 0.03, 0.02)
 
 
@@ -572,7 +599,8 @@ class ResultsSaver:
 def build_params(cfg: ExperimentConfig):
     tp = TransitionParams(belief_seed_cap=cfg.belief_seed_cap,
                           belief_seed_floor=cfg.belief_seed_floor,
-                          tau_fire=cfg.tau_fire, tau_burn=cfg.tau_burn)
+                          tau_fire=cfg.tau_fire, tau_burn=cfg.tau_burn,
+                          burn_duration=cfg.burn_duration)
     sp = SensorParams(pm=cfg.pm, fov_radius=cfg.fov_radius,
                       log_odds_clamp=cfg.log_odds_clamp)
     pp = PlannerParams(horizon=cfg.horizon, num_particles=cfg.num_particles,
@@ -601,6 +629,9 @@ def build_params(cfg: ExperimentConfig):
                     decay_rate=cfg.decay_rate, max_fuel_coeff=cfg.max_fuel_coeff,
                     avg_wind_speed=cfg.avg_wind_speed,
                     avg_wind_direction=cfg.avg_wind_direction,
+                    wind_speed_std=cfg.wind_speed_std,
+                    wind_dir_std=cfg.wind_dir_std,
+                    hotspot_jitter_std=cfg.hotspot_jitter_std,
                     base_prior=cfg.base_prior)
     return tp, sp, pp, fp
 
@@ -626,6 +657,11 @@ def run_experiment(cfg: ExperimentConfig):
     """
 
     tp, sp, pp, fp = build_params(cfg)
+
+    # Persist the seed used for this run so figures can be reproduced later.
+    os.makedirs(cfg.results_dir, exist_ok=True)
+    with open(os.path.join(cfg.results_dir, "seed.txt"), "w") as f:
+        f.write(str(cfg.seed))
 
     env = FinalWildfireMonitoringEnv(world_size=cfg.world_size, duration=cfg.duration,
                                      fireAreas_Num=cfg.fire_areas_num, seed=cfg.seed)
@@ -781,9 +817,15 @@ def run_experiment(cfg: ExperimentConfig):
 # ==============================================================================
 
 if __name__ == "__main__":
+    # New random seed every run.  We print the seed at startup AND save it
+    # to <results_dir>/seed.txt inside run_experiment, so any run can be
+    # reproduced exactly by passing the same integer back into seed=...
+    random_seed = int(time.time() * 1e6) % (2**32 - 1)
+    print(f"[eval] random seed for this run: {random_seed}")
+
     cfg = ExperimentConfig(
         world_size=100, duration=200, fire_areas_num=3,
-        num_uavs=3, seed=42, results_dir="eval_results",
+        num_uavs=3, seed=random_seed, results_dir="eval_results",
         save_csv=True, save_plots=True, render_pause=0.01,
     )
     run_experiment(cfg)
