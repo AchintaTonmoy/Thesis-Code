@@ -38,7 +38,15 @@ class TransitionParams:
     belief_seed_floor: float = 0.015
 
     tau_fire: float = 0.10
-    tau_burn: float = 0.05
+    tau_burn: float = 0.05   # retained for back-compat; no longer used by the FSM
+
+    # NEW: a cell that has been in the FIRE state for `burn_duration` steps
+    # transitions to BURNED.  This replaces the previous "intensity_map < tau_burn"
+    # rule, which was dimensionally inconsistent with the front-based propagation
+    # model (fronts represent the LEADING EDGE of fire, not the only-burning cells;
+    # a cell that the front has just left is not extinguished — it is simply in the
+    # interior of the still-burning region until its local fuel is exhausted).
+    burn_duration: int = 40
 
     eps: float = 1e-6
 
@@ -110,6 +118,9 @@ class FireParams:
     max_fuel_coeff: float = 3.0
     avg_wind_speed: float = 4.0
     avg_wind_direction: float = np.pi / 10
+    wind_dir_std: float = 2.0        # std of wind direction (rad); set low for directional spread
+    wind_speed_std: float = 2.0      # std of wind speed; set low for consistent wind
+    hotspot_jitter_std: float = 0.0  # Gaussian jitter (cells) applied to ignition points
 
     base_prior: Tuple[float, float, float] = (0.95, 0.03, 0.02)
 
@@ -223,39 +234,70 @@ def intensity_to_state_map(
     intensity_map: np.ndarray,
     prev_state_map: Optional[np.ndarray],
     tau_fire: float,
-    tau_burn: float,
+    tau_burn: float,                                        # kept for back-compat
+    cell_age_map: Optional[np.ndarray] = None,
+    burn_duration: Optional[int] = None,
 ) -> np.ndarray:
     """
-    Explicit finite-state-machine transitions for each cell:
+    Finite-state-machine transitions on the {HEALTHY, FIRE, BURNED} grid.
 
-        HEALTHY  --[intensity > tau_fire]--> FIRE
-        FIRE     --[intensity < tau_burn]--> BURNED   (hysteresis: stays FIRE in gap)
-        BURNED   --> BURNED                           (absorbing: no fuel remaining)
+        HEALTHY -> FIRE    when intensity_map > tau_fire
+        FIRE    -> BURNED  when the cell has been FIRE for `burn_duration` steps
+                           (tracked by the caller in `cell_age_map`)
+        BURNED  -> BURNED  (absorbing — fuel exhausted)
 
-    Starting from prev_state_map (not a blank canvas) gives hysteresis:
-    a FIRE cell whose intensity dips into [tau_burn, tau_fire] stays FIRE
-    instead of silently reverting to HEALTHY.
+    PHYSICAL JUSTIFICATION
+    ----------------------
+    The propagation model in WildFire_Model.fire_propagation advances each
+    fire-front (x, y) ONE step at a time along the local wind direction.
+    The fronts represent the *leading edge* of the burning region.  After
+    one or two propagation steps, a front leaves the cell it started in.
+
+    The previous criterion
+
+        FIRE -> BURNED  when  intensity_map < tau_burn
+
+    is dimensionally inconsistent with this representation: the rasterised
+    intensity at a cell drops to zero the moment the front moves on, and
+    the cell would flip to BURNED within 1–3 steps even though the ground
+    there is still burning.  A diagnostic of the original code showed 53%
+    of the fire region becoming BURNED in just 5 simulation steps; the
+    cause is structural, not a tuning issue.
+
+    Real fires don't extinguish on a per-cell basis the moment the flame
+    front passes.  The interior of the fire keeps burning until the local
+    fuel is exhausted, which is a *temporal* property of the cell, not an
+    instantaneous property of the intensity field.  A fixed-duration burn
+    timer captures exactly this: each cell remains FIRE for `burn_duration`
+    steps after first ignition, then becomes BURNED.
+
+    `tau_burn` is retained in the signature to preserve API compatibility
+    but is no longer consulted by the transition logic.
     """
     assert tau_burn < tau_fire, (
-        f"tau_burn ({tau_burn}) must be < tau_fire ({tau_fire}) for hysteresis to be valid"
+        f"tau_burn ({tau_burn}) must be < tau_fire ({tau_fire}) "
+        "for parameter sanity (tau_burn unused at runtime)"
     )
 
     if prev_state_map is None:
         prev_state_map = np.full(intensity_map.shape, HEALTHY, dtype=np.int32)
 
-    # Inherit previous state — hysteresis by default.
+    # Inherit previous state — hysteresis by default; BURNED is absorbing.
     state_map = prev_state_map.copy()
 
-    # HEALTHY → FIRE: fresh ignition only when intensity crosses the upper threshold.
+    # HEALTHY -> FIRE: fresh ignition only when intensity crosses tau_fire.
     ignition = (prev_state_map == HEALTHY) & (intensity_map > tau_fire)
     state_map[ignition] = FIRE
 
-    # FIRE → BURNED: fire dies out only when intensity drops below the lower threshold.
-    extinguish = (prev_state_map == FIRE) & (intensity_map < tau_burn)
-    state_map[extinguish] = BURNED
+    # FIRE -> BURNED: only when a cell has spent burn_duration steps in FIRE.
+    # If the caller does not supply cell_age_map / burn_duration (e.g. the
+    # one-shot reset call), no FIRE -> BURNED transitions occur — newly
+    # ignited cells simply start at age 0.
+    if cell_age_map is not None and burn_duration is not None:
+        timed_out = (prev_state_map == FIRE) & (cell_age_map >= int(burn_duration))
+        state_map[timed_out] = BURNED
 
-    # BURNED → BURNED: absorbing state, already preserved by the copy above.
-
+    # BURNED -> BURNED already preserved by the .copy() above.
     return state_map
 
 def _safe_pruned_list(pruned_points: Optional[np.ndarray]) -> List[List[int]]:
@@ -359,9 +401,11 @@ def predict_belief_with_tracked_state(
     belief_previous_terrain: np.ndarray,
     belief_burnt_out_points: np.ndarray,
     belief_prev_state_map: Optional[np.ndarray],
+    belief_cell_age_map: Optional[np.ndarray] = None,       # NEW
+    burn_duration: Optional[int] = None,                    # NEW
     rng: Optional[np.random.Generator] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
-           np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+           np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
     eps = transition_params.eps
     nx = ny = world_size
@@ -379,8 +423,10 @@ def predict_belief_with_tracked_state(
         empty1 = np.zeros((0,), dtype=float)
         prev_sm = belief_prev_state_map if belief_prev_state_map is not None \
                   else np.full((nx, ny), HEALTHY, dtype=np.int32)
+        prev_age = belief_cell_age_map if belief_cell_age_map is not None \
+                   else np.zeros((nx, ny), dtype=np.int32)
         return (predicted, z, z,
-                empty3, empty1, empty3, empty3, prev_sm)
+                empty3, empty1, empty3, empty3, prev_sm, prev_age)
 
     next_belief_fronts, next_belief_time_vector, next_belief_burnt_out = \
         simulate_fire_one_step(
@@ -397,11 +443,30 @@ def predict_belief_with_tracked_state(
     pred_active_raster_raw = rasterize_intensity(next_belief_fronts, world_size)
     pred_burnt_raster_raw  = rasterize_intensity(next_belief_burnt_out, world_size)
 
+    # ------------------------------------------------------------------
+    # Belief-side cell-age update (mirrors the true-side update in env.step):
+    #  cells that were FIRE in the previous belief MAP get age += 1; cells
+    #  in any other state are reset to 0.  The newly computed state map
+    #  then uses this updated age to drive FIRE -> BURNED transitions.
+    # ------------------------------------------------------------------
+    if belief_cell_age_map is None:
+        belief_cell_age_map = np.zeros((nx, ny), dtype=np.int32)
+    if belief_prev_state_map is None:
+        next_belief_cell_age_map = np.zeros((nx, ny), dtype=np.int32)
+    else:
+        next_belief_cell_age_map = np.where(
+            belief_prev_state_map == FIRE,
+            belief_cell_age_map + 1,
+            0,
+        ).astype(np.int32)
+
     next_belief_state_map = intensity_to_state_map(
         intensity_map=pred_active_raster_raw,
         prev_state_map=belief_prev_state_map,
         tau_fire=tau_fire,
         tau_burn=tau_burn,
+        cell_age_map=next_belief_cell_age_map,
+        burn_duration=burn_duration,
     )
 
     # -----------------------------------------------------------------------
@@ -473,7 +538,7 @@ def predict_belief_with_tracked_state(
     return (predicted, pred_active_norm, pred_burnt_norm,
             next_belief_fronts, next_belief_time_vector,
             next_belief_burnt_out, next_belief_prev_terrain,
-            next_belief_state_map)
+            next_belief_state_map, next_belief_cell_age_map)
 
 def containing_cell_from_position(robot_xy: Sequence[float], world_size: int) -> Tuple[int, int]:
     x = float(robot_xy[0])
@@ -1131,9 +1196,13 @@ class FinalWildfireMonitoringEnv:
             max_fuel_coeff=float(fire_params.max_fuel_coeff),
             avg_wind_speed=float(fire_params.avg_wind_speed),
             avg_wind_direction=float(fire_params.avg_wind_direction),
+            wind_speed_std=float(fire_params.wind_speed_std),
+            wind_dir_std=float(fire_params.wind_dir_std),
         )
 
-        self.active_fronts = self.wildfire.hotspot_init()
+        self.active_fronts = self.wildfire.hotspot_init(
+            hotspot_jitter_std=float(fire_params.hotspot_jitter_std),
+        )
         self.previous_terrain_map = self.active_fronts.copy()
         self.time_vector = np.zeros(self.active_fronts.shape[0], dtype=float)
         self.burnt_out_points = np.zeros((0, 3), dtype=float)
@@ -1145,6 +1214,15 @@ class FinalWildfireMonitoringEnv:
             tau_fire=self.tau_fire,
             tau_burn=self.tau_burn,
         )
+
+        # ----------------------------------------------------------------
+        # Cell-age tracking (driver for the FIRE -> BURNED transition).
+        # Each cell's age = number of consecutive steps it has spent in
+        # the FIRE state.  Initial-ignition cells are at age 0.
+        # ----------------------------------------------------------------
+        self.burn_duration: int = int(transition_params.burn_duration)
+        self.true_cell_age_map  = np.zeros((n, n), dtype=np.int32)
+        self.belief_cell_age_map = np.zeros((n, n), dtype=np.int32)
 
         self.belief_map = initialize_belief_from_initial_fire(
             world_size=n,
@@ -1209,7 +1287,7 @@ class FinalWildfireMonitoringEnv:
 
         (belief_pred, pred_active_raster, pred_burnt_raster,
          next_b_fronts, next_b_time, next_b_burnt, next_b_prev_terrain,
-         next_b_state_map) = predict_belief_with_tracked_state(
+         next_b_state_map, next_b_cell_age_map) = predict_belief_with_tracked_state(
             belief_map=self.belief_map,
             wildfire_model=self.wildfire,
             geo_phys_info=self.geo_phys_info,
@@ -1223,6 +1301,8 @@ class FinalWildfireMonitoringEnv:
             belief_previous_terrain=self.belief_previous_terrain,
             belief_burnt_out_points=self.belief_burnt_out_points,
             belief_prev_state_map=self.belief_state_map,
+            belief_cell_age_map=self.belief_cell_age_map,
+            burn_duration=self.burn_duration,
             rng=self.rng,
         )
 
@@ -1231,6 +1311,7 @@ class FinalWildfireMonitoringEnv:
         self.belief_burnt_out_points = next_b_burnt
         self.belief_previous_terrain = next_b_prev_terrain
         self.belief_state_map = next_b_state_map
+        self.belief_cell_age_map = next_b_cell_age_map
 
         self.pred_belief_active_raster = pred_active_raster
         self.pred_belief_burnt_raster = pred_burnt_raster
@@ -1254,11 +1335,25 @@ class FinalWildfireMonitoringEnv:
         )
 
         self.true_intensity_map = rasterize_intensity(self.active_fronts, self.world_size)
+
+        # ----------------------------------------------------------------
+        # True-state cell-age update (mirrors belief-side update).
+        # Increment age for cells currently in FIRE; reset others to 0.
+        # The new age then drives FIRE -> BURNED in intensity_to_state_map.
+        # ----------------------------------------------------------------
+        self.true_cell_age_map = np.where(
+            self.true_state_map == FIRE,
+            self.true_cell_age_map + 1,
+            0,
+        ).astype(np.int32)
+
         self.true_state_map = intensity_to_state_map(
             self.true_intensity_map,
             prev_state_map=self.true_state_map,
             tau_fire=self.tau_fire,
             tau_burn=self.tau_burn,
+            cell_age_map=self.true_cell_age_map,
+            burn_duration=self.burn_duration,
         )
 
         for i in range(self.num_uavs):
